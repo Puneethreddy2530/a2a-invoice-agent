@@ -100,6 +100,7 @@ try:
     assert client.post("/message:send", headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"}, json={}).status_code == 415
     assert client.post("/message:send", headers={"Authorization": "Bearer test-token", "Content-Type": "application/a2a+json", "A2A-Version": "99.0"}, content=b"{}").status_code == 400
     assert client.get("/tasks", headers={"Authorization": "Bearer test-token"}).status_code == 200
+    assert client.post("/tasks/not-a-task:cancel").status_code == 401
     # Domain conflicts on HTTP+JSON message:send remain A2A task responses
     # (HTTP 200) with a failed task and explicit error payload, not transport 409.
     h = {"Authorization": "Bearer test-token", "Content-Type": "application/a2a+json", "A2A-Version": "1.0"}
@@ -113,6 +114,8 @@ try:
     assert conflict_http.json()["status"]["state"] == "TASK_STATE_FAILED"
     assert conflict_data["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
     assert conflict_data["side_effects"] == "none"
+    invalid_continuation = client.post("/message:send", headers=h, json={"taskId": first["id"], "message": {"messageId": "http-invalid-cont", "contextId": first["contextId"], "parts": [{"text": "should not continue"}]}})
+    assert invalid_continuation.status_code == 409, invalid_continuation.text
 except Exception as exc:
     if exc.__class__.__name__ == "TypeError" and "TestClient" in str(exc):
         print("NOTE: ASGI TestClient is unavailable in this environment; protocol checks skipped.")
@@ -141,7 +144,12 @@ for thread in threads: thread.join()
 assert not race_errors and len(race_results) == 6, race_errors
 assert sum(item["action"] == "PAY" for item in race_results) == 1, Counter(item["action"] for item in race_results)
 assert all(item["action"] in {"PAY", "DO_NOT_PAY_DUPLICATE", "HOLD_FOR_RECONCILIATION"} for item in race_results)
-receipts = {item.get("payment", {}).get("receipt", {}).get("receipt_id") for item in race_results if item.get("payment", {}).get("receipt", {}).get("receipt_id")}
+receipts = {
+    item.get("payment", {}).get("receipt", {}).get("receipt_id")
+    for item in race_results
+    if isinstance(item.get("payment", {}).get("receipt"), dict)
+    and item["payment"]["receipt"].get("receipt_id")
+}
 assert len(receipts) == 1, receipts
 
 # Audit retention caps are enforced independently for actions and receipts.
