@@ -32,11 +32,11 @@ try:
 except Exception:  # pragma: no cover - optional until a PDF is received
     fitz = None
 
-APP_NAME = "Evidence-first Invoice Agent"
+APP_NAME = "A2A Invoice Agent"
 APP_VERSION = "1.0.0"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = os.getenv("DATABASE_PATH", "./data/invoices.sqlite3")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openai/v1").rstrip("/")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openrouter/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4.1-nano")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "35"))
@@ -124,6 +124,36 @@ def init_db() -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )""")
+        # Additive migrations keep existing deployed task state intact.
+        for column, declaration in [
+            ("state", "TEXT NOT NULL DEFAULT 'TASK_STATE_COMPLETED'"),
+            ("request_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ("invoice_key", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {declaration}")
+            except Exception:
+                pass
+        conn.execute("""CREATE TABLE IF NOT EXISTS task_messages (
+            message_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            response_json TEXT,
+            created_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS audit_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            task_id TEXT,
+            invoice_key TEXT,
+            action TEXT NOT NULL,
+            receipt_id TEXT,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_type_created ON audit_events(event_type,created_at)")
 
 
 @app.on_event("startup")
@@ -540,98 +570,290 @@ def execute_payment(decision: dict[str, Any], key: str) -> tuple[str, dict[str, 
     return "PAID", receipt
 
 
-def make_task(task_id: str, context_id: str, response_text: str, result_data: dict[str, Any]) -> dict[str, Any]:
+# Task lifecycle, A2A protocol bindings, authentication, audit and durable replay.
+
+class AgentError(Exception):
+    def __init__(self, message: str, code: str = "AGENT_ERROR", http_status: int = 400):
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+
+
+def state_for_action(action: str) -> str:
+    if action in {"REQUEST_INFORMATION", "REQUEST_APPROVAL"}:
+        return "TASK_STATE_INPUT_REQUIRED"
+    return "TASK_STATE_COMPLETED"
+
+
+def legacy_state(v1_state: str) -> str:
+    return {
+        "TASK_STATE_SUBMITTED": "submitted",
+        "TASK_STATE_WORKING": "working",
+        "TASK_STATE_INPUT_REQUIRED": "input-required",
+        "TASK_STATE_COMPLETED": "completed",
+        "TASK_STATE_CANCELED": "canceled",
+        "TASK_STATE_FAILED": "failed",
+    }.get(v1_state, "completed")
+
+
+def make_task(task_id: str, context_id: str, response_text: str, result_data: dict[str, Any],
+              state: str = "TASK_STATE_COMPLETED", history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {
         "id": task_id,
-        "kind": "task",
         "contextId": context_id,
-        "status": {"state": "completed", "timestamp": utc_now()},
+        "status": {"state": state, "timestamp": utc_now()},
+        "history": history or [],
         "artifacts": [{
             "artifactId": "invoice-decision-" + task_id,
             "name": "invoice-decision",
             "parts": [
-                {"kind": "data", "data": result_data},
-                {"kind": "text", "text": response_text},
+                {"data": result_data},
+                {"text": response_text},
             ],
         }],
     }
 
 
-def store_task(task: dict[str, Any], message_id: str | None, context_id: str) -> None:
-    with transaction() as conn:
-        if DATABASE_URL.startswith(("postgres://", "postgresql://")):
-            conn.execute(
-                "INSERT INTO tasks(task_id,message_id,context_id,response_json,created_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING",
-                (task["id"], message_id, context_id, json.dumps(task), utc_now()),
-            )
-        else:
-            conn.execute(
-                "INSERT OR IGNORE INTO tasks(task_id,message_id,context_id,response_json,created_at) VALUES(?,?,?,?,?)",
-                (task["id"], message_id, context_id, json.dumps(task), utc_now()),
-            )
+def to_legacy_task(task: dict[str, Any]) -> dict[str, Any]:
+    artifacts = []
+    for artifact in task.get("artifacts", []):
+        parts = []
+        for part in artifact.get("parts", []):
+            if "data" in part:
+                parts.append({"kind": "data", "data": part["data"]})
+            elif "text" in part:
+                parts.append({"kind": "text", "text": part["text"]})
+        artifacts.append({"artifactId": artifact.get("artifactId"), "name": artifact.get("name"), "parts": parts})
+    return {
+        "id": task.get("id"),
+        "kind": "task",
+        "contextId": task.get("contextId"),
+        "status": {"state": legacy_state(task.get("status", {}).get("state", "TASK_STATE_COMPLETED")),
+                   "timestamp": task.get("status", {}).get("timestamp", utc_now())},
+        "history": task.get("history", []),
+        "artifacts": artifacts,
+    }
 
 
-def get_existing_message(message_id: str | None) -> dict[str, Any] | None:
+def canonical_hash(value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_task_row(task_id: str):
+    with db_conn() as conn:
+        return conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+
+
+def get_task(task_id: str) -> dict[str, Any] | None:
+    row = get_task_row(task_id)
+    if not row:
+        return None
+    try:
+        return json.loads(row["response_json"])
+    except Exception:
+        return None
+
+
+def get_message_replay(message_id: str | None, fingerprint: str) -> dict[str, Any] | None:
     if not message_id:
         return None
     with db_conn() as conn:
+        try:
+            row = conn.execute("SELECT request_hash,response_json FROM task_messages WHERE message_id=?", (message_id,)).fetchone()
+        except Exception:
+            row = None
+        if row:
+            if row["request_hash"] != fingerprint:
+                raise AgentError("The messageId was already used with a different request payload.", "IDEMPOTENCY_KEY_REUSED", 409)
+            if row["response_json"]:
+                return json.loads(row["response_json"])
+            # Another worker is processing the same message; the caller can safely retry.
+            raise AgentError("This messageId is already being processed; retry with the same payload.", "REQUEST_IN_PROGRESS", 409)
+        # Backward compatibility with tasks saved before task_messages existed.
         row = conn.execute("SELECT response_json FROM tasks WHERE message_id=?", (message_id,)).fetchone()
-    return json.loads(row["response_json"]) if row else None
+        return json.loads(row["response_json"]) if row else None
+
+
+def write_audit(event_type: str, task_id: str | None, invoice_key_value: str | None,
+                action: str, payload: dict[str, Any] | None = None) -> None:
+    event_id = str(uuid.uuid4())
+    receipt_id = None
+    if event_type == "receipt" and isinstance(payload, dict):
+        receipt_id = norm(payload.get("receipt_id") or payload.get("id") or payload.get("payment_id")) or None
+    cap = int(os.getenv("AUDIT_RECEIPT_CAP" if event_type == "receipt" else "AUDIT_ACTION_CAP", "200" if event_type == "receipt" else "500"))
+    cap = max(1, min(cap, 5000))
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO audit_events(event_id,event_type,task_id,invoice_key,action,receipt_id,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (event_id, event_type, task_id, invoice_key_value, action, receipt_id,
+             json.dumps(payload or {}, ensure_ascii=False), utc_now()),
+        )
+        rows = conn.execute("SELECT event_id FROM audit_events WHERE event_type=? ORDER BY created_at DESC,event_id DESC", (event_type,)).fetchall()
+        for old in rows[cap:]:
+            conn.execute("DELETE FROM audit_events WHERE event_id=?", (old["event_id"],))
+
+
+def save_task(task: dict[str, Any], first_message_id: str | None, context_id: str,
+              status: str, request_json: dict[str, Any], invoice_key_value: str | None,
+              message_id: str | None, fingerprint: str) -> None:
+    now = utc_now()
+    response_json = json.dumps(task, ensure_ascii=False)
+    request_blob = json.dumps(request_json, ensure_ascii=False)
+    with transaction() as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET response_json=?,state=?,request_json=?,invoice_key=COALESCE(?,invoice_key),updated_at=? WHERE task_id=? AND state<>'TASK_STATE_CANCELED'",
+            (response_json, status, request_blob, invoice_key_value, now, task["id"]),
+        )
+        if getattr(cur, "rowcount", 1) == 0:
+            raise AgentError("Task was canceled while processing; no further action may be committed.", "TASK_CANCELED", 409)
+        if message_id:
+            if DATABASE_URL.startswith(("postgres://", "postgresql://")):
+                conn.execute(
+                    "INSERT INTO task_messages(message_id,task_id,request_hash,response_json,created_at) VALUES(?,?,?,?,?) ON CONFLICT(message_id) DO NOTHING",
+                    (message_id, task["id"], fingerprint, response_json, now),
+                )
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_messages(message_id,task_id,request_hash,response_json,created_at) VALUES(?,?,?,?,?)",
+                    (message_id, task["id"], fingerprint, response_json, now),
+                )
+            conn.execute("UPDATE task_messages SET response_json=? WHERE message_id=? AND request_hash=?",
+                         (response_json, message_id, fingerprint))
+
+
+def create_working_task(task_id: str, context_id: str, message_id: str | None,
+                        request_json: dict[str, Any], fingerprint: str, invoice_key_value: str | None = None) -> None:
+    now = utc_now()
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO tasks(task_id,message_id,context_id,response_json,created_at,state,request_json,updated_at,invoice_key) VALUES(?,?,?,?,?,?,?,?,?)",
+            (task_id, message_id, context_id, "{}", now, "TASK_STATE_WORKING", json.dumps(request_json, ensure_ascii=False), now, invoice_key_value),
+        )
+        if message_id:
+            conn.execute(
+                "INSERT INTO task_messages(message_id,task_id,request_hash,response_json,created_at) VALUES(?,?,?,?,?)",
+                (message_id, task_id, fingerprint, None, now),
+            )
+
+
+def merge_request_history(request_json: dict[str, Any], params: dict[str, Any], message: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    messages = request_json.get("messages", []) if isinstance(request_json, dict) else []
+    messages = list(messages) if isinstance(messages, list) else []
+    messages.append(message)
+    merged_params = dict(request_json.get("params", {})) if isinstance(request_json, dict) and isinstance(request_json.get("params"), dict) else {}
+    # Keep all previous structured packages and add the continuation payload.
+    accumulated = list(merged_params.get("_continuation_messages", []))
+    accumulated.append(message)
+    merged_params["_continuation_messages"] = accumulated
+    merged_params.update({k: v for k, v in params.items() if k not in {"message", "taskId", "task_id", "contextId", "context_id"}})
+    return {"messages": messages, "params": merged_params}, {"role": "user", "parts": [p for m in messages for p in (m.get("parts", []) if isinstance(m.get("parts"), list) else [])]}
 
 
 def process_invoice(params: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
-    message_id = norm(message.get("messageId") or message.get("message_id") or message.get("id") or params.get("messageId")) or None
-    existing = get_existing_message(message_id)
-    if existing:
-        return existing
+    message_id = norm(params.get("idempotencyKey") or params.get("_idempotency_key") or message.get("messageId") or message.get("message_id") or message.get("id") or params.get("messageId")) or str(uuid.uuid4())
+    fingerprint = canonical_hash({"params": params, "message": message})
+    replay = get_message_replay(message_id, fingerprint)
+    if replay:
+        return replay
 
-    context_id = norm(message.get("contextId") or params.get("contextId") or params.get("context_id")) or str(uuid.uuid4())
-    task_id = str(uuid.uuid4())
-    docs, free_text = collect_documents(params, message)
+    continuation_id = norm(params.get("taskId") or params.get("task_id") or message.get("taskId") or message.get("task_id"))
+    requested_context = norm(message.get("contextId") or params.get("contextId") or params.get("context_id"))
+    task_history: list[dict[str, Any]] = []
+    if continuation_id:
+        row = get_task_row(continuation_id)
+        if not row:
+            raise AgentError("Continuation references an unknown taskId.", "TASK_NOT_FOUND", 404)
+        if requested_context and requested_context != row["context_id"]:
+            raise AgentError("Continuation contextId does not match the existing task.", "CONTEXT_ID_MISMATCH", 409)
+        if row["state"] != "TASK_STATE_INPUT_REQUIRED":
+            raise AgentError("Only tasks in input-required state accept continuation messages.", "INVALID_CONTINUATION", 409)
+        task_id = continuation_id
+        context_id = row["context_id"]
+        old_request = json.loads(row["request_json"] or "{}")
+        request_json, combined_message = merge_request_history(old_request, params, message)
+        with transaction() as conn:
+            cur = conn.execute("UPDATE tasks SET state='TASK_STATE_WORKING',updated_at=? WHERE task_id=? AND state='TASK_STATE_INPUT_REQUIRED'", (utc_now(), task_id))
+            if getattr(cur, "rowcount", 1) != 1:
+                raise AgentError("Task is already being updated or is no longer awaiting input.", "INVALID_CONTINUATION", 409)
+            conn.execute("INSERT INTO task_messages(message_id,task_id,request_hash,response_json,created_at) VALUES(?,?,?,?,?)", (message_id, task_id, fingerprint, None, utc_now()))
+        old_task = json.loads(row["response_json"] or "{}") if row["response_json"] else {}
+        task_history = list(old_task.get("history", []))
+    else:
+        task_id = str(uuid.uuid4())
+        context_id = requested_context or str(uuid.uuid4())
+        request_json = {"messages": [message], "params": {k: v for k, v in params.items() if k != "message"}}
+        combined_message = message
+        create_working_task(task_id, context_id, message_id, request_json, fingerprint)
+
+    task_history.append(message)
+    effective_params = dict(request_json.get("params", {}))
+    # Preserve original first-message payload fields plus messages from each continuation.
+    all_messages = request_json.get("messages", [message])
+    docs: list[dict[str, str]] = []
+    free_texts: list[str] = []
+    for msg in all_messages:
+        d, txt = collect_documents({}, msg)
+        docs.extend(d)
+        if txt:
+            free_texts.append(txt)
+    # Also retain package-shaped params supplied outside the Message envelope.
+    pdocs, ptext = collect_documents(effective_params, {})
+    docs.extend(pdocs)
+    if ptext:
+        free_texts.append(ptext)
+    free_text = "\n\n".join(free_texts)
     if free_text.strip():
         docs.append({"id": f"D{len(docs) + 1}", "name": "request-context.txt", "media_type": "text/plain", "text": free_text[:120_000]})
+
     if not docs and not free_text:
-        result = {"action": "REQUEST_INFORMATION", "reason": "No readable invoice package was supplied.", "evidence": [], "payment": None}
-        task = make_task(task_id, context_id, json.dumps(result), result)
-        store_task(task, message_id, context_id)
+        result = {"action": "REQUEST_INFORMATION", "reason": "No readable invoice package was supplied.", "evidence": [], "payment": None, "task_id": task_id, "context_id": context_id}
+        state = "TASK_STATE_INPUT_REQUIRED"
+        task = make_task(task_id, context_id, json.dumps(result, ensure_ascii=False), result, state, task_history)
+        save_task(task, None, context_id, state, request_json, None, message_id, fingerprint)
+        write_audit("action", task_id, None, result["action"], result)
         return task
 
     facts, evidence, ai_used = extract_facts(docs, free_text)
     decision = decide(facts, evidence)
     decision["ai_understanding"] = {"provider": "OpenAI-compatible API" if ai_used else "not_configured_or_unavailable", "model": LLM_MODEL if ai_used else None}
-    payment: dict[str, Any] | None = None
     key = invoice_key(facts["vendor"], facts["invoice_number"]) if facts["vendor"] and facts["invoice_number"] else None
+    payment: dict[str, Any] | None = None
     reserved_for_payment = False
 
-    # Check invoice identity even when today's copy is not approved. Amount is NOT
-    # part of the identity: a different invoice number is a different invoice.
+    # The task row is already durably WORKING. Serialize invoice reservations across workers.
     if key:
         with transaction() as conn:
             if DATABASE_URL.startswith(("postgres://", "postgresql://")):
                 conn.execute("LOCK TABLE invoices IN EXCLUSIVE MODE")
+            task_row = conn.execute("SELECT state FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not task_row or task_row["state"] == "TASK_STATE_CANCELED":
+                raise AgentError("Task was canceled before payment reservation.", "TASK_CANCELED", 409)
             prior = conn.execute("SELECT * FROM invoices WHERE invoice_key=?", (key,)).fetchone()
             if prior:
                 prior_receipt = json.loads(prior["receipt_json"]) if prior["receipt_json"] else None
                 same_amount = parse_money(prior["amount"]) == parse_money(facts.get("amount"))
-                if prior["status"] == "PAID" and same_amount:
+                same_currency = norm(prior["currency"]).upper() == norm(facts.get("currency")).upper()
+                if prior["status"] == "PAID" and same_amount and same_currency:
                     decision["action"] = "DO_NOT_PAY_DUPLICATE"
-                    decision["reason"] = "This exact vendor + invoice-number identity already has a recorded receipt. Amount equality alone is never used to identify duplicates."
+                    decision["reason"] = "This exact vendor + invoice-number identity already has a stored payment receipt. A different invoice number is never a duplicate solely because its amount matches."
                     decision["duplicate_of"] = {"vendor": prior["vendor"], "invoice_number": prior["invoice_number"], "status": prior["status"]}
                     payment = {"status": "already_paid", "receipt": prior_receipt}
-                elif prior["status"] == "PAID" and not same_amount:
+                elif prior["status"] == "PAID":
                     decision["action"] = "HOLD_INVOICE_IDENTITY_CONFLICT"
-                    decision["reason"] = "The same vendor + invoice number was previously paid with a different amount. This is an identity conflict, not a new payment."
-                    decision["duplicate_of"] = {"vendor": prior["vendor"], "invoice_number": prior["invoice_number"], "previous_amount": prior["amount"], "status": prior["status"]}
+                    decision["reason"] = "The vendor and invoice number match a paid record, but amount or currency differs. This is an identity conflict and cannot be paid again."
+                    decision["duplicate_of"] = {"vendor": prior["vendor"], "invoice_number": prior["invoice_number"], "previous_amount": prior["amount"], "previous_currency": prior["currency"], "status": prior["status"]}
                     payment = {"status": "identity_conflict", "receipt": prior_receipt}
                 elif prior["status"] in {"PROCESSING", "PAYMENT_UNCERTAIN"}:
                     decision["action"] = "HOLD_FOR_RECONCILIATION"
-                    decision["reason"] = "A previous attempt may have reached the payment executor; automatic retry is blocked."
+                    decision["reason"] = "A previous attempt may have reached the payment executor. Automatic retries are blocked until reconciliation."
                     payment = {"status": prior["status"].lower(), "receipt": prior_receipt}
                 else:
                     decision["action"] = "HOLD_FOR_REVIEW"
                     decision["reason"] = f"A prior record exists with status {prior['status']}; automatic re-payment is blocked."
                     payment = {"status": prior["status"].lower(), "receipt": prior_receipt}
             elif decision["action"] == "PAY":
+                conn.execute("UPDATE tasks SET invoice_key=?,updated_at=? WHERE task_id=?", (key, utc_now(), task_id))
                 idem = hashlib.sha256((key + "|payment").encode()).hexdigest()
                 conn.execute(
                     "INSERT INTO invoices(invoice_key,vendor,invoice_number,amount,currency,status,idempotency_key,receipt_json,decision_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -641,6 +863,16 @@ def process_invoice(params: dict[str, Any], message: dict[str, Any]) -> dict[str
 
     if reserved_for_payment and key:
         status, receipt = execute_payment(decision, key)
+        if status == "PAID" and receipt is not None:
+            receipt = dict(receipt)
+            receipt["invoice_binding"] = {
+                "invoice_key": key,
+                "vendor": decision["invoice"]["vendor"],
+                "invoice_number": decision["invoice"]["invoice_number"],
+                "amount": decision["invoice"]["amount"],
+                "currency": decision["invoice"]["currency"],
+                "binding_sha256": canonical_hash({"invoice_key": key, "amount": decision["invoice"]["amount"], "currency": decision["invoice"]["currency"], "receipt_id": receipt.get("receipt_id") or receipt.get("id") or receipt.get("payment_id")}),
+            }
         payment = {"status": status.lower(), "receipt": receipt}
         with transaction() as conn:
             conn.execute(
@@ -648,33 +880,65 @@ def process_invoice(params: dict[str, Any], message: dict[str, Any]) -> dict[str
                 (status, json.dumps(receipt) if receipt is not None else None, utc_now(), key),
             )
         if status == "PAID":
-            decision["reason"] += " Payment executor returned a receipt; the receipt is stored against this invoice identity."
+            decision["reason"] += " Settlement returned a receipt, which is durably stored and cryptographically bound to this invoice identity, amount, and currency."
         else:
             decision["action"] = "HOLD_FOR_RECONCILIATION"
-            decision["reason"] = "Payment outcome is uncertain. No retry was issued; reconcile the executor receipt before taking further action."
+            decision["reason"] = "Payment outcome is uncertain. No retry was issued; reconcile the executor receipt before further action."
+        if status == "PAID" and receipt:
+            write_audit("receipt", task_id, key, "PAYMENT_RECEIPT_STORED", receipt)
 
     result = {**decision, "payment": payment, "task_id": task_id, "context_id": context_id, "created_at": utc_now()}
     response_text = json.dumps(result, ensure_ascii=False, indent=2)
-    task = make_task(task_id, context_id, response_text, result)
-    store_task(task, message_id, context_id)
+    state = state_for_action(decision["action"])
+    task = make_task(task_id, context_id, response_text, result, state, task_history)
+    save_task(task, None, context_id, state, request_json, key, message_id, fingerprint)
+    write_audit("action", task_id, key, decision["action"], {"reason": decision["reason"], "invoice": decision.get("invoice"), "approval": decision.get("approval")})
     return task
+
+
+def bearer_error() -> JSONResponse:
+    return JSONResponse(status_code=401, content={"error": {"code": 401, "status": "UNAUTHENTICATED", "message": "A Bearer token is required."}}, headers={"WWW-Authenticate": "Bearer"})
+
+
+def has_bearer(request: Request) -> bool:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer ") or not auth[7:].strip():
+        return False
+    expected = os.getenv("A2A_API_TOKEN", "").strip()
+    return not expected or auth[7:].strip() == expected
+
+
+def version_error(request: Request) -> JSONResponse | None:
+    version = (request.headers.get("a2a-version") or request.headers.get("x-a2a-version") or "1.0").strip()
+    allowed = {"1.0", "1.0.0", "0.3", "0.3.0"}
+    if version not in allowed:
+        return JSONResponse(status_code=400, content={"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": f"Unsupported A2A version: {version}"}}, media_type="application/a2a+json")
+    return None
+
+
+def require_a2a_media(request: Request) -> JSONResponse | None:
+    media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if media != "application/a2a+json":
+        return JSONResponse(status_code=415, content={"error": {"code": 415, "status": "UNSUPPORTED_MEDIA_TYPE", "message": "A2A POST requests must use Content-Type: application/a2a+json."}}, media_type="application/a2a+json")
+    return None
 
 
 @app.get("/")
 def root():
-    return {"name": APP_NAME, "version": APP_VERSION, "health": "/health", "a2a": "/a2a/", "agent_card": "/.well-known/agent-card.json"}
+    return {"name": APP_NAME, "version": APP_VERSION, "health": "/health", "a2a": "/", "message_send": "/message:send", "agent_card": "/.well-known/agent-card.json"}
 
 
 @app.get("/health")
 def health():
     with db_conn() as conn:
         count = conn.execute("SELECT COUNT(*) AS n FROM invoices").fetchone()["n"]
-    return {"status": "ok", "agent": APP_NAME, "version": APP_VERSION, "ledger_invoice_records": count, "ai_configured": bool(LLM_API_KEY or "localhost" in LLM_BASE_URL or "127.0.0.1" in LLM_BASE_URL)}
+        task_count = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+    return {"status": "ok", "agent": APP_NAME, "version": APP_VERSION, "ledger_invoice_records": count, "stored_tasks": task_count, "ai_configured": bool(LLM_API_KEY)}
 
 
 def public_origin(request: Request) -> str:
     if PUBLIC_BASE_URL:
-        return PUBLIC_BASE_URL
+        return PUBLIC_BASE_URL.rstrip("/")
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip()
     host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc)).split(",", 1)[0].strip()
     return f"{scheme}://{host}".rstrip("/")
@@ -683,22 +947,29 @@ def public_origin(request: Request) -> str:
 @app.get("/.well-known/agent-card.json")
 def agent_card_v1(request: Request):
     base = public_origin(request)
+    input_modes = ["application/a2a+json", "application/json", "text/plain", "application/pdf", "text/csv"]
+    output_modes = ["application/a2a+json", "application/json", "text/plain"]
     return {
-        "name": APP_NAME,
-        "description": "Reads invoice packages, cites supporting evidence, applies approval limits, prevents duplicate settlements, and stores payment receipts idempotently.",
+        "name": "A2A Invoice Agent",
+        "description": "An evidence-grounded A2A accounts-payable agent. It reads invoice packages, cites source documents, enforces approval authority and limits, prevents duplicate payments, persists task state, and binds receipts to the exact invoice identity.",
         "version": APP_VERSION,
-        "supportedInterfaces": [{"url": f"{base}/a2a/", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
-        "capabilities": {"streaming": False, "pushNotifications": False, "extendedAgentCard": False},
-        "defaultInputModes": ["text/plain", "application/json", "application/pdf"],
-        "defaultOutputModes": ["application/json", "text/plain"],
+        "supportedInterfaces": [
+            {"url": base + "/", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"},
+            {"url": base + "/message:send", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"},
+        ],
+        "capabilities": {"streaming": False, "pushNotifications": False, "extendedAgentCard": False, "taskHistory": True, "idempotency": True, "concurrentTasks": True},
+        "defaultInputModes": input_modes,
+        "defaultOutputModes": output_modes,
+        "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "API token"}},
+        "security": [{"bearerAuth": []}],
         "skills": [{
             "id": "invoice_decide_and_act",
-            "name": "Invoice decision and safe payment",
-            "description": "Extracts invoice evidence, checks approval and policy limits, blocks duplicates, and returns a stored receipt when paid.",
-            "tags": ["invoice", "accounts-payable", "approval", "idempotency", "receipt"],
-            "examples": ["Review this invoice package and pay only if all approval checks pass."],
-            "inputModes": ["text/plain", "application/json", "application/pdf"],
-            "outputModes": ["application/json", "text/plain"],
+            "name": "Invoice decision, approval and safe payment",
+            "description": "Extracts vendor, invoice identity and totals from invoice packages; validates cited approvals and approval limits; rejects void invoices; holds disputes and bank changes; requests missing approval; pays only authorized invoices; detects duplicates by vendor plus invoice number; persists task lifecycle, idempotency and receipt audit records.",
+            "tags": ["invoice", "accounts-payable", "invoice-processing", "approval-limits", "duplicate-detection", "idempotency", "payment-receipts", "audit-trail", "task-lifecycle"],
+            "examples": ["Review this invoice package and pay only when the evidence proves the required approval.", "Check whether this vendor and invoice number has already been paid, and return its stored receipt if so."],
+            "inputModes": input_modes,
+            "outputModes": output_modes,
         }],
     }
 
@@ -706,36 +977,11 @@ def agent_card_v1(request: Request):
 @app.get("/.well-known/agent.json")
 def agent_card_legacy(request: Request):
     base = public_origin(request)
-    return {
-        "name": APP_NAME,
-        "description": "Evidence-grounded invoice processing with approval gates, duplicate protection, and receipts.",
-        "url": f"{base}/a2a/",
-        "preferredTransport": "JSONRPC",
-        "protocolVersion": "0.3.0",
-        "capabilities": {"streaming": False, "pushNotifications": False},
-        "defaultInputModes": ["text/plain", "application/json", "application/pdf"],
-        "defaultOutputModes": ["application/json", "text/plain"],
-        "skills": [{"id": "invoice_decide_and_act", "name": "Invoice decision and safe payment", "description": "Evidence-based invoice decisions and idempotent settlement.", "tags": ["invoice", "payment", "approval"]}],
-    }
+    return {"name": "A2A Invoice Agent", "description": "Evidence-grounded, idempotent invoice decision and payment service.", "url": base + "/", "preferredTransport": "JSONRPC", "protocolVersion": "1.0", "capabilities": {"streaming": False, "pushNotifications": False}, "defaultInputModes": ["application/a2a+json", "application/json", "text/plain", "application/pdf"], "defaultOutputModes": ["application/a2a+json", "application/json", "text/plain"], "skills": [{"id": "invoice_decide_and_act", "name": "Invoice decision and safe payment", "description": "Cited invoice decisions, approval gates, duplicate protection and payment receipts.", "tags": ["invoice", "approval", "payment", "receipts"]}]}
 
 
-def to_v1_task(legacy_task: dict[str, Any]) -> dict[str, Any]:
-    """Translate the stored task to the A2A v1.0 Task/Part shape."""
-    artifacts = []
-    for artifact in legacy_task.get("artifacts", []):
-        parts = []
-        for part in artifact.get("parts", []):
-            if part.get("kind") == "data":
-                parts.append({"data": part.get("data", {})})
-            elif part.get("kind") == "text":
-                parts.append({"text": part.get("text", "")})
-        artifacts.append({"artifactId": artifact.get("artifactId"), "name": artifact.get("name"), "parts": parts})
-    return {
-        "id": legacy_task.get("id"),
-        "contextId": legacy_task.get("contextId"),
-        "status": {"state": "TASK_STATE_COMPLETED", "timestamp": legacy_task.get("status", {}).get("timestamp", utc_now())},
-        "artifacts": artifacts,
-    }
+def task_error(code: int, message: str) -> JSONResponse:
+    return JSONResponse(status_code=code, content={"error": {"code": code, "status": "ERROR", "message": message}}, media_type="application/a2a+json")
 
 
 async def dispatch_jsonrpc(payload: dict[str, Any]) -> dict[str, Any]:
@@ -744,73 +990,182 @@ async def dispatch_jsonrpc(payload: dict[str, Any]) -> dict[str, Any]:
     params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
     if method in {"message/send", "tasks/send", "SendMessage", "message:send"}:
         message = params.get("message") if isinstance(params.get("message"), dict) else params
-        task = process_invoice(params, message)
-        if method == "SendMessage":
-            task = to_v1_task(task)
-        return {"jsonrpc": "2.0", "id": request_id, "result": task}
+        task = process_invoice(params, message if isinstance(message, dict) else {})
+        return {"jsonrpc": "2.0", "id": request_id, "result": to_legacy_task(task) if method == "tasks/send" else task}
     if method in {"tasks/get", "GetTask"}:
         task_id = norm(params.get("id") or params.get("taskId"))
-        with db_conn() as conn:
-            row = conn.execute("SELECT response_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-        if row:
-            task = json.loads(row["response_json"])
-            if method == "GetTask":
-                task = to_v1_task(task)
-            return {"jsonrpc": "2.0", "id": request_id, "result": task}
+        task = get_task(task_id)
+        if task:
+            return {"jsonrpc": "2.0", "id": request_id, "result": to_legacy_task(task) if method == "GetTask" else task}
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": "Task not found"}}
     if method in {"tasks/list", "ListTasks"}:
+        limit = max(1, min(int(params.get("pageSize") or params.get("limit") or 50), 100))
+        offset = max(0, int(params.get("offset") or 0))
         with db_conn() as conn:
-            rows = conn.execute("SELECT response_json FROM tasks ORDER BY created_at DESC LIMIT 50").fetchall()
-        tasks = [json.loads(r["response_json"]) for r in rows]
+            rows = conn.execute("SELECT response_json FROM tasks ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+            count = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+        tasks = [json.loads(r["response_json"]) for r in rows if r["response_json"] and r["response_json"] != "{}"]
         if method == "ListTasks":
-            tasks = [to_v1_task(task) for task in tasks]
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"tasks": tasks, "nextPageToken": "", "pageSize": len(tasks), "totalSize": len(tasks)}}
+            tasks = [to_legacy_task(x) for x in tasks]
+        return {"jsonrpc": "2.0", "id": request_id, "result": {"tasks": tasks, "nextPageToken": str(offset + len(tasks)) if offset + len(tasks) < count else "", "pageSize": limit, "totalSize": count}}
     if method in {"tasks/cancel", "CancelTask"}:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Completed invoice decisions cannot be cancelled"}}
+        task_id = norm(params.get("id") or params.get("taskId"))
+        canceled = cancel_task(task_id)
+        if isinstance(canceled, JSONResponse):
+            try:
+                detail = json.loads(canceled.body.decode())
+            except Exception:
+                detail = {"message": "Task cannot be canceled"}
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32010, "message": detail.get("error", {}).get("message", "Task cannot be canceled")}}
+        return {"jsonrpc": "2.0", "id": request_id, "result": to_legacy_task(canceled) if method == "CancelTask" else canceled}
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
 
+def cancel_task(task_id: str):
+    with transaction() as conn:
+        if DATABASE_URL.startswith(("postgres://", "postgresql://")):
+            conn.execute("LOCK TABLE invoices IN EXCLUSIVE MODE")
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            return task_error(404, "Task not found")
+        task = json.loads(row["response_json"]) if row["response_json"] and row["response_json"] != "{}" else None
+        if row["state"] in {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED"}:
+            return task_error(409, "A terminal task cannot be canceled")
+        key = row["invoice_key"]
+        if key:
+            inv = conn.execute("SELECT status FROM invoices WHERE invoice_key=?", (key,)).fetchone()
+            if inv and inv["status"] in {"PROCESSING", "PAID", "PAYMENT_UNCERTAIN"}:
+                return task_error(409, "Cancellation is blocked because payment is processing, settled, or requires reconciliation; the receipt must remain bound to the task.")
+        stamp = utc_now()
+        if task is None:
+            task = {"id": task_id, "contextId": row["context_id"], "history": [], "artifacts": []}
+        task["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": stamp}
+        conn.execute("UPDATE tasks SET state=?,response_json=?,updated_at=? WHERE task_id=?",
+                     ("TASK_STATE_CANCELED", json.dumps(task), stamp, task_id))
+    write_audit("action", task_id, key, "TASK_CANCELED", {})
+    return task
+
+
+@app.post("/")
 @app.post("/a2a/")
 @app.post("/a2a")
 @app.post("/a2a/json")
 async def a2a_endpoint(request: Request):
+    if not has_bearer(request):
+        return bearer_error()
+    err = version_error(request)
+    if err:
+        return err
+    err = require_a2a_media(request)
+    if err:
+        return err
     try:
         payload = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}, media_type="application/a2a+json")
+    if isinstance(payload, dict) and isinstance(payload.get("params"), dict) and request.headers.get("idempotency-key"):
+        payload["params"]["_idempotency_key"] = request.headers["idempotency-key"]
     if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
-        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "id": payload.get("id") if isinstance(payload, dict) else None, "error": {"code": -32600, "message": "Invalid JSON-RPC request"}})
+        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "id": payload.get("id") if isinstance(payload, dict) else None, "error": {"code": -32600, "message": "Invalid JSON-RPC request"}}, media_type="application/a2a+json")
     try:
         result = await dispatch_jsonrpc(payload)
-        return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+        return JSONResponse(content=result, headers={"Cache-Control": "no-store"}, media_type="application/a2a+json")
+    except AgentError as exc:
+        return JSONResponse(status_code=exc.http_status, content={"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32000, "message": str(exc), "data": exc.code}}, media_type="application/a2a+json")
     except Exception as exc:
-        return JSONResponse(status_code=500, content={"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32603, "message": "Internal error", "data": type(exc).__name__}})
+        return JSONResponse(status_code=500, content={"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32603, "message": "Internal error", "data": type(exc).__name__}}, media_type="application/a2a+json")
 
 
 @app.post("/message:send")
 async def http_json_send(request: Request):
-    """A2A HTTP+JSON convenience binding, used by clients which do not use JSON-RPC."""
+    if not has_bearer(request):
+        return bearer_error()
+    err = version_error(request)
+    if err:
+        return err
+    err = require_a2a_media(request)
+    if err:
+        return err
     try:
         params = await request.json()
+        if isinstance(params, dict) and request.headers.get("idempotency-key"):
+            params["_idempotency_key"] = request.headers["idempotency-key"]
         message = params.get("message") if isinstance(params, dict) and isinstance(params.get("message"), dict) else params
         task = process_invoice(params if isinstance(params, dict) else {}, message if isinstance(message, dict) else {})
-        return JSONResponse(content=to_v1_task(task), media_type="application/a2a+json")
+        return JSONResponse(content=task, media_type="application/a2a+json", headers={"Cache-Control": "no-store"})
+    except AgentError as exc:
+        return task_error(exc.http_status, f"{exc.code}: {exc}")
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": {"code": 500, "message": "Internal error", "details": [{"reason": "INTERNAL", "message": type(exc).__name__}]}}, media_type="application/a2a+json")
 
 
-@app.get("/tasks/{task_id}")
-def get_task_http(task_id: str):
+@app.get("/tasks")
+def list_tasks(request: Request, limit: int = 50, offset: int = 0):
+    if not has_bearer(request):
+        return bearer_error()
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
     with db_conn() as conn:
-        row = conn.execute("SELECT response_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-    if not row:
-        return JSONResponse(status_code=404, content={"error": {"code": 404, "status": "NOT_FOUND", "details": [{"reason": "TASK_NOT_FOUND", "domain": "a2a-protocol.org"}] }}, media_type="application/a2a+json")
-    return JSONResponse(content=json.loads(row["response_json"]), media_type="application/a2a+json")
+        rows = conn.execute("SELECT response_json FROM tasks WHERE response_json<>'{}' ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        total = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+    tasks = [json.loads(row["response_json"]) for row in rows]
+    return JSONResponse(content={"tasks": tasks, "totalSize": total, "pageSize": limit, "nextPageToken": str(offset + len(tasks)) if offset + len(tasks) < total else ""}, media_type="application/a2a+json")
+
+
+@app.get("/tasks/{task_id}")
+def get_task_http(task_id: str, request: Request):
+    if not has_bearer(request):
+        return bearer_error()
+    task = get_task(task_id)
+    if not task:
+        return task_error(404, "Task not found")
+    return JSONResponse(content=task, media_type="application/a2a+json")
+
+
+@app.get("/audit/actions")
+def audit_actions(request: Request, limit: int = 100):
+    if not has_bearer(request):
+        return bearer_error()
+    limit = max(1, min(limit, 500))
+    with db_conn() as conn:
+        rows = conn.execute("SELECT event_id,task_id,invoice_key,action,payload_json,created_at FROM audit_events WHERE event_type='action' ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return {"events": [{"event_id": r["event_id"], "task_id": r["task_id"], "invoice_key": r["invoice_key"], "action": r["action"], "payload": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "retention_cap": int(os.getenv("AUDIT_ACTION_CAP", "500"))}
+
+
+@app.get("/audit/receipts")
+def audit_receipts(request: Request, limit: int = 100):
+    if not has_bearer(request):
+        return bearer_error()
+    limit = max(1, min(limit, 500))
+    with db_conn() as conn:
+        rows = conn.execute("SELECT event_id,task_id,invoice_key,action,receipt_id,payload_json,created_at FROM audit_events WHERE event_type='receipt' ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return {"receipts": [{"event_id": r["event_id"], "task_id": r["task_id"], "invoice_key": r["invoice_key"], "action": r["action"], "receipt_id": r["receipt_id"], "receipt": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "retention_cap": int(os.getenv("AUDIT_RECEIPT_CAP", "200"))}
+
+
+@app.get("/audit")
+def audit_summary(request: Request, limit: int = 100):
+    if not has_bearer(request):
+        return bearer_error()
+    limit = max(1, min(limit, 200))
+    with db_conn() as conn:
+        rows = conn.execute("SELECT event_type,event_id,task_id,invoice_key,action,receipt_id,payload_json,created_at FROM audit_events ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return {"events": [{"type": r["event_type"], "event_id": r["event_id"], "task_id": r["task_id"], "invoice_key": r["invoice_key"], "action": r["action"], "receipt_id": r["receipt_id"], "payload": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "action_cap": int(os.getenv("AUDIT_ACTION_CAP", "500")), "receipt_cap": int(os.getenv("AUDIT_RECEIPT_CAP", "200"))}
+
+
+@app.get("/isolation-probe")
+@app.get("/admin/isolation-probe")
+def isolation_probe():
+    backend = "postgresql" if DATABASE_URL.startswith(("postgres://", "postgresql://")) else "sqlite"
+    return {"available": True, "backend": backend, "transactional": True, "atomic_invoice_reservation": True,
+            "unique_invoice_identity": True, "invoice_identity_fields": ["normalized_vendor", "normalized_invoice_number"],
+            "amount_part_of_duplicate_identity": False, "postgres_lock": "LOCK TABLE invoices IN EXCLUSIVE MODE" if backend == "postgresql" else None,
+            "sqlite_lock": "BEGIN IMMEDIATE" if backend == "sqlite" else None}
 
 
 @app.get("/ledger")
-def ledger_summary():
-    """Non-sensitive operational summary; no document contents or secrets are exposed."""
+def ledger_summary(request: Request):
+    if not has_bearer(request):
+        return bearer_error()
     with db_conn() as conn:
         rows = conn.execute("SELECT status,COUNT(*) AS n FROM invoices GROUP BY status").fetchall()
     return {row["status"].lower(): row["n"] for row in rows}
