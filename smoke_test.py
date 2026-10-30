@@ -35,6 +35,8 @@ first = submit("req-1", "INV-100", "450.00", "500.00")
 assert data(first)["action"] == "PAY", data(first)
 receipt = data(first)["payment"]["receipt"]
 assert receipt["receipt_id"] and receipt["invoice_binding"]["invoice_number"] == "INV-100"
+assert data(first)["evidence_ids"] and data(first)["decision_basis"]
+assert data(first)["deduplication"]["amount_is_part_of_identity"] is False
 
 same_invoice = submit("req-2", "INV-100", "450.00", "500.00", "not approved")
 assert data(same_invoice)["action"] == "DO_NOT_PAY_DUPLICATE", data(same_invoice)
@@ -95,12 +97,15 @@ try:
     assert client.post("/message:send", json={}).status_code == 401
     card = client.get("/.well-known/agent-card.json").json()
     assert card["supportedInterfaces"][0]["url"].endswith("/")
+    assert card["url"].endswith("/")
+    assert any(skill["id"] == "invoice-processing" for skill in card["skills"])
     assert "application/a2a+json" in card["defaultInputModes"]
     assert card["skills"] and card["security"]
     assert client.post("/message:send", headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"}, json={}).status_code == 415
     assert client.post("/message:send", headers={"Authorization": "Bearer test-token", "Content-Type": "application/a2a+json", "A2A-Version": "99.0"}, content=b"{}").status_code == 400
     assert client.get("/tasks", headers={"Authorization": "Bearer test-token"}).status_code == 200
     assert client.post("/tasks/not-a-task:cancel").status_code == 401
+    assert client.post("/tasks/cancel", headers={"Authorization": "Bearer test-token", "Content-Type": "application/a2a+json"}, json={"id": "missing"}).status_code == 404
     # Domain conflicts on HTTP+JSON message:send remain A2A task responses
     # (HTTP 200) with a failed task and explicit error payload, not transport 409.
     h = {"Authorization": "Bearer test-token", "Content-Type": "application/a2a+json", "A2A-Version": "1.0"}
