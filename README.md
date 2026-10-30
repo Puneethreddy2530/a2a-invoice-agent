@@ -39,7 +39,7 @@ A continuation message includes the original `taskId` and `contextId` and one `a
 
 Allowed actions are `settle_invoice`, `request_approval`, `hold_invoice`, `reject_duplicate`, and `open_exception`.
 
-The AI reads the full package and proposes one action with typed invoice facts, exactly three source-grounded evidence references, and a rationale citing at least two references. The validator rejects invented or missing references and malformed output. If the model is unavailable or returns invalid output, the service falls back to conservative rules that hold ambiguous cases rather than settle them.
+The AI reads the full package and proposes one action with typed invoice facts, exactly three source-grounded evidence references, and a rationale citing at least two references. The validator rejects invented or missing references and malformed output. A package-specific safety layer then applies its own controlling facts: exact paid-invoice identity, void/dispute flags, bank-detail changes, PO mismatches, approval state, amount-vs-approval/delegated/settlement caps, goods receipt or service acceptance, and vendor/bank verification. A proposed settlement is downgraded unless the evidence establishes all mandatory clearances. One invoice's warning does not impose a blanket action on unrelated packages. If the model is unavailable or returns invalid output, the service falls back to conservative per-package rules that hold ambiguous cases rather than settle them.
 
 Duplicate identity is normalized vendor name + normalized invoice number. Amount is not part of identity; different invoice numbers with the same amount are separate invoices. An accepted `settle_invoice` result is stored in the paid ledger; a later proposal for the same identity is converted to `reject_duplicate`. A payment is never marked settled when merely proposed.
 
@@ -49,7 +49,7 @@ PostgreSQL is used when `DATABASE_URL` is set; SQLite is available for local dev
 
 Message replay is keyed by `(principal, messageId)`. Replaying the same message and body returns the stored task. Reusing the same message ID with a different body returns HTTP 409. Result submission and cancellation lock the same task row/transaction so the task cannot become both canceled and completed. No model call occurs for a stored message replay, task read, task list, cancellation, or receipt continuation.
 
-Audit retention is configurable with `AUDIT_ACTION_CAP` and `AUDIT_RECEIPT_CAP` (defaults 500 and 200 per principal).
+Audit retention is configurable with `AUDIT_ACTION_CAP` and `AUDIT_RECEIPT_CAP` (defaults 100 each per principal). API list limits are clamped to the configured retention cap. A claim batch is limited to 100 packages (`MAX_PACKAGES`, configurable downward; values above 100 are clamped).
 
 ## Render environment
 
@@ -73,4 +73,4 @@ pip install -r requirements.txt
 python smoke_test.py
 ```
 
-The smoke tests cover the custom Agent Card and media types, authentication, version rejection, per-Bearer task isolation, source-grounded evidence, input-required/complete/canceled lifecycle, receipt nonce binding, message replay/conflicts, different invoice numbers with the same amount, repeated invoice identity, audit retention, and concurrent identical submissions.
+The smoke tests cover the custom Agent Card and media types, authentication, version rejection, per-Bearer task isolation, source-grounded evidence, package-specific business dispositions, approval/settlement caps, input-required/complete/canceled lifecycle, receipt nonce binding, message replay/conflicts, different invoice numbers with the same amount, repeated invoice identity, audit retention/API caps, concurrent identical submissions, and cancel-vs-receipt race arbitration.
