@@ -998,3 +998,164 @@ def protected_task_row(task_id: str, principal: str):
         row = con.execute("SELECT * FROM invoice_a2a_tasks WHERE task_id=? AND principal=?", (task_id, principal)).fetchone()
     if row is None:
         # Do not reveal whether another principal owns this task.
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND"})
+    return row
+
+
+@app.get("/a2a/tasks")
+@app.get("/tasks")
+def list_tasks(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    pageSize: int = 20,
+    pageToken: str = "",
+    contextId: str | None = None,
+):
+    principal = auth_principal(authorization)
+    check_protocol(request)
+    page_size = max(1, min(int(pageSize), 50))
+    try:
+        offset = max(0, int(pageToken)) if pageToken else 0
+    except ValueError:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_PAGE_TOKEN"})
+    with db_conn() as con:
+        if contextId:
+            total = con.execute("SELECT COUNT(*) AS n FROM invoice_a2a_tasks WHERE principal=? AND context_id=?", (principal, contextId)).fetchone()["n"]
+            rows = con.execute("SELECT task_id,context_id,state,created_at,updated_at FROM invoice_a2a_tasks WHERE principal=? AND context_id=? ORDER BY created_at DESC,task_id DESC LIMIT ? OFFSET ?", (principal, contextId, page_size + 1, offset)).fetchall()
+        else:
+            total = con.execute("SELECT COUNT(*) AS n FROM invoice_a2a_tasks WHERE principal=?", (principal,)).fetchone()["n"]
+            rows = con.execute("SELECT task_id,context_id,state,created_at,updated_at FROM invoice_a2a_tasks WHERE principal=? ORDER BY created_at DESC,task_id DESC LIMIT ? OFFSET ?", (principal, page_size + 1, offset)).fetchall()
+    has_more = len(rows) > page_size
+    rows = rows[:page_size]
+    compact = [{
+        "id": r["task_id"],
+        "contextId": r["context_id"],
+        "status": {"state": r["state"], "timestamp": r["updated_at"]},
+        "metadata": {"createdAt": r["created_at"], "updatedAt": r["updated_at"]},
+    } for r in rows]
+    payload = {"tasks": compact, "totalSize": total, "pageSize": page_size, "nextPageToken": str(offset + len(rows)) if has_more else ""}
+    if len(canonical(payload).encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "RESPONSE_TOO_LARGE"})
+    return JSONResponse(payload, media_type=A2A_MT, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/a2a/tasks/{task_id}")
+@app.get("/tasks/{task_id}")
+def get_task(task_id: str, request: Request, authorization: str | None = Header(default=None)):
+    principal = auth_principal(authorization)
+    check_protocol(request)
+    row = protected_task_row(task_id, principal)
+    task_blob = row["task_json"]
+    if len(task_blob.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "RESPONSE_TOO_LARGE"})
+    return JSONResponse(json.loads(task_blob), media_type=A2A_MT, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/message:send")
+async def message_send(request: Request, authorization: str | None = Header(default=None)):
+    return await send_message_impl(request, authorization)
+
+
+@app.post("/a2a/message:send")
+async def a2a_message_send(request: Request, authorization: str | None = Header(default=None)):
+    return await send_message_impl(request, authorization)
+
+
+def cancel_task_for_principal(task_id: str, principal: str) -> dict:
+    with transaction() as con:
+        lock = " FOR UPDATE" if DB_URL.startswith(("postgres://", "postgresql://")) else ""
+        row = con.execute("SELECT * FROM invoice_a2a_tasks WHERE task_id=? AND principal=?" + lock, (task_id, principal)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail={"code": "NOT_FOUND"})
+        if row["state"] != "TASK_STATE_INPUT_REQUIRED":
+            raise HTTPException(status_code=409, detail={"code": "TASK_TERMINAL"})
+        task = json.loads(row["task_json"])
+        task["status"] = task_status("TASK_STATE_CANCELED")
+        stamp = now()
+        canceled_blob = canonical(task)
+        con.execute("UPDATE invoice_a2a_tasks SET state=?,task_json=?,updated_at=? WHERE task_id=? AND principal=?", ("TASK_STATE_CANCELED", canceled_blob, stamp, task_id, principal))
+        con.execute("UPDATE invoice_a2a_messages SET state='TERMINAL',response_json=? WHERE principal=? AND task_id=?", (canceled_blob, principal, task_id))
+        add_audit(con, principal, "action", task_id, "", "cancel_task", None, {"state": "TASK_STATE_CANCELED"})
+        prune_audit(con, principal, "action")
+    return task
+
+
+@app.post("/a2a/tasks/{task_id}:cancel")
+@app.post("/tasks/{task_id}:cancel")
+async def cancel_task(task_id: str, request: Request, authorization: str | None = Header(default=None)):
+    principal = auth_principal(authorization)
+    check_protocol(request, post=True)
+    return response_task(cancel_task_for_principal(task_id, principal))
+
+
+@app.post("/tasks/cancel")
+async def cancel_task_body(request: Request, authorization: str | None = Header(default=None)):
+    principal = auth_principal(authorization)
+    check_protocol(request, post=True)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_JSON"})
+    task_id = body.get("taskId") or body.get("id") if isinstance(body, dict) else None
+    if not isinstance(task_id, str) or not task_id:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_TASK_ID"})
+    return response_task(cancel_task_for_principal(task_id, principal))
+
+
+@app.get("/a2a/audit/actions")
+@app.get("/audit/actions")
+def audit_actions(request: Request, authorization: str | None = Header(default=None), limit: int = 100):
+    principal = auth_principal(authorization)
+    check_protocol(request)
+    cap = max(1, min(int(os.getenv("AUDIT_ACTION_CAP", "100")), 5000))
+    limit = max(1, min(limit, cap))
+    with db_conn() as con:
+        rows = con.execute("SELECT * FROM invoice_a2a_audit WHERE principal=? AND event_type='action' ORDER BY created_at DESC,event_id DESC LIMIT ?", (principal, limit)).fetchall()
+    return {"events": [{"event_id": r["event_id"], "task_id": r["task_id"], "package_id": r["package_id"], "action": r["action"], "payload": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "retention_cap": cap}
+
+
+@app.get("/a2a/audit/receipts")
+@app.get("/audit/receipts")
+def audit_receipts(request: Request, authorization: str | None = Header(default=None), limit: int = 100):
+    principal = auth_principal(authorization)
+    check_protocol(request)
+    cap = max(1, min(int(os.getenv("AUDIT_RECEIPT_CAP", "100")), 5000))
+    limit = max(1, min(limit, cap))
+    with db_conn() as con:
+        rows = con.execute("SELECT * FROM invoice_a2a_audit WHERE principal=? AND event_type='receipt' ORDER BY created_at DESC,event_id DESC LIMIT ?", (principal, limit)).fetchall()
+    return {"receipts": [{"event_id": r["event_id"], "task_id": r["task_id"], "package_id": r["package_id"], "action": r["action"], "receipt_nonce": r["receipt_nonce"], "receipt": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "retention_cap": cap}
+
+
+@app.get("/a2a/isolation-probe")
+@app.get("/isolation-probe")
+@app.get("/admin/isolation-probe")
+def isolation_probe():
+    # Public, non-sensitive diagnostic: deliberately does not reveal tenant IDs,
+    # task counts, task IDs or any caller data. Actual task routes remain Bearer protected.
+    return {
+        "available": True,
+        "authentication_required_for_task_routes": True,
+        "principal_scoped_task_reads": True,
+        "principal_scoped_task_lists": True,
+        "compact_task_lists": True,
+        "stable_task_reads": True,
+        "cross_principal_reads": False,
+        "database": "postgresql" if DB_URL.startswith(("postgres://", "postgresql://")) else "sqlite",
+        "transactional": True,
+        "max_response_bytes": MAX_RESPONSE_BYTES,
+    }
+
+
+@app.get("/audit")
+def audit_summary(request: Request, authorization: str | None = Header(default=None), limit: int = 100):
+    principal = auth_principal(authorization)
+    check_protocol(request)
+    limit = max(1, min(limit, 200))
+    with db_conn() as con:
+        rows = con.execute("SELECT * FROM invoice_a2a_audit WHERE principal=? ORDER BY created_at DESC LIMIT ?", (principal, limit)).fetchall()
+    return {"events": [{"type": r["event_type"], "event_id": r["event_id"], "task_id": r["task_id"], "package_id": r["package_id"], "action": r["action"], "receipt_nonce": r["receipt_nonce"], "payload": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "action_cap": int(os.getenv("AUDIT_ACTION_CAP", "100")), "receipt_cap": int(os.getenv("AUDIT_RECEIPT_CAP", "100"))}
+
+
+# Local import convenience and test initialization. Render starts through uvicorn and triggers startup too.
+if os.getenv("INIT_DB_ON_IMPORT", "0") == "1":
+    init_db()
