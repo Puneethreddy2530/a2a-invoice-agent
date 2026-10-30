@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: a2a-invoice-agent
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: gpt-4o-mini
+      - key: LLM_BASE_URL
+        value: https://api.openai.com/v1
+      - key: AUTO_APPROVAL_LIMIT
+        value: ""
