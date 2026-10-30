@@ -6,11 +6,13 @@ This service implements the GA3 invoice **claim batch → action proposals → a
 
 - Public Agent Card: `GET /.well-known/agent-card.json`
 - Public health: `GET /health`
-- Protected message send: `POST /message:send`
-- Protected task listing/get: `GET /tasks`, `GET /tasks/{task_id}`
-- Protected cancellation: `POST /tasks/{task_id}:cancel`
-- Protected audit: `GET /audit/actions`, `GET /audit/receipts`, `GET /audit`
-- Protected isolation diagnostic: `GET /isolation-probe`
+- A2A interface base URL: `https://<host>/a2a/`
+- Protected message send: `POST /a2a/message:send`
+- Protected task listing/get: `GET /a2a/tasks`, `GET /a2a/tasks/{task_id}`
+- Protected cancellation: `POST /a2a/tasks/{task_id}:cancel`
+- Protected audit: `GET /a2a/audit/actions`, `GET /a2a/audit/receipts`
+- Protected isolation diagnostic: `GET /a2a/isolation-probe`
+- Root aliases are also provided for compatibility.
 
 All protected requests require a non-empty `Authorization: Bearer <token>` and `A2A-Version: 1.0`. All POST requests require `Content-Type: application/a2a+json`.
 
