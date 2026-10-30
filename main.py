@@ -271,9 +271,13 @@ def collect_documents(params: dict[str, Any], message: dict[str, Any]) -> tuple[
     docs: list[dict[str, str]] = []
     free_text: list[str] = []
 
-    def add_doc(name: str, media_type: str, content: str) -> None:
+    def add_doc(name: str, media_type: str, content: str, source_id: Any = None) -> None:
         if content.strip():
-            doc_id = f"D{len(docs) + 1}"
+            requested_id = norm(source_id)
+            used_ids = {d["id"] for d in docs}
+            doc_id = requested_id if requested_id and requested_id not in used_ids else f"D{len(docs) + 1}"
+            while doc_id in used_ids:
+                doc_id = f"D{len(docs) + 1}-{len(used_ids) + 1}"
             docs.append({"id": doc_id, "name": name or f"document-{len(docs) + 1}", "media_type": media_type, "text": content[:120_000]})
 
     def process_part(part: Any) -> None:
@@ -332,7 +336,8 @@ def collect_documents(params: dict[str, Any], message: dict[str, Any]) -> tuple[
                         if isinstance(item.get("text") or item.get("content"), str):
                             name = norm(item.get("name") or item.get("filename") or f"document-{idx + 1}")
                             content = item.get("text") if isinstance(item.get("text"), str) else item.get("content")
-                            add_doc(name, norm(item.get("mime_type") or item.get("mimeType") or "text/plain"), content)
+                            add_doc(name, norm(item.get("mime_type") or item.get("mimeType") or "text/plain"), content,
+                                    item.get("document_id") or item.get("doc_id") or item.get("id"))
                         elif isinstance(item.get("url"), str):
                             process_part({"url": item["url"]})
                         elif isinstance(item.get("bytes"), str):
@@ -945,10 +950,19 @@ def has_bearer(request: Request) -> bool:
 
 
 def version_error(request: Request) -> JSONResponse | None:
+    # The published Agent Card advertises A2A 1.0 only.
     version = (request.headers.get("a2a-version") or request.headers.get("x-a2a-version") or "1.0").strip()
-    allowed = {"1.0", "1.0.0", "0.3", "0.3.0"}
-    if version not in allowed:
-        return JSONResponse(status_code=400, content={"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": f"Unsupported A2A version: {version}"}}, media_type="application/a2a+json")
+    if version != "1.0":
+        return JSONResponse(
+            status_code=400,
+            content={"error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": f"Unsupported A2A version: {version}",
+                "supportedVersions": ["1.0"],
+            }},
+            media_type="application/a2a+json",
+        )
     return None
 
 
@@ -987,20 +1001,22 @@ def agent_card_v1(request: Request):
     output_modes = ["application/a2a+json", "application/json", "text/plain"]
     return {
         "name": "A2A Invoice Agent",
-        "url": base + "/",
-        "preferredTransport": "JSONRPC",
-        "protocolVersion": "1.0",
         "description": "An evidence-grounded A2A accounts-payable agent. It reads invoice packages, cites source documents, enforces approval authority and limits, prevents duplicate payments, persists task state, and binds receipts to the exact invoice identity.",
         "version": APP_VERSION,
         "supportedInterfaces": [
+            {"url": base + "/", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"},
             {"url": base + "/", "protocolBinding": "JSONRPC", "protocolVersion": "1.0"},
-            {"url": base + "/message:send", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"},
         ],
-        "capabilities": {"streaming": False, "pushNotifications": False, "extendedAgentCard": False, "taskHistory": True, "idempotency": True, "concurrentTasks": True},
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": True,
+            "extendedAgentCard": False,
+        },
         "defaultInputModes": input_modes,
         "defaultOutputModes": output_modes,
         "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "API token"}},
-        "security": [{"bearerAuth": []}],
+        "securityRequirements": [{"bearerAuth": []}],
         "skills": [{
             "id": "invoice-processing",
             "name": "Invoice processing and safe payment",
@@ -1139,7 +1155,8 @@ async def http_json_send(request: Request):
             params["_idempotency_key"] = request.headers["idempotency-key"]
         message = params.get("message") if isinstance(params, dict) and isinstance(params.get("message"), dict) else params
         task = process_invoice(params if isinstance(params, dict) else {}, message if isinstance(message, dict) else {})
-        return JSONResponse(content=task, media_type="application/a2a+json", headers={"Cache-Control": "no-store"})
+        # A2A HTTP+JSON SendMessageResponse uses a task/message response envelope.
+        return JSONResponse(content={"task": task}, media_type="application/a2a+json", headers={"Cache-Control": "no-store"})
     except AgentError as exc:
         if exc.code not in {"IDEMPOTENCY_KEY_REUSED", "REQUEST_IN_PROGRESS"}:
             return task_error(exc.http_status, f"{exc.code}: {exc}")
@@ -1160,7 +1177,7 @@ async def http_json_send(request: Request):
             task_id, context_id, json.dumps(error_result, ensure_ascii=False),
             error_result, "TASK_STATE_FAILED", [msg_obj] if msg_obj else []
         )
-        return JSONResponse(content=rejected, status_code=200, media_type="application/a2a+json", headers={"Cache-Control": "no-store"})
+        return JSONResponse(content={"task": rejected}, status_code=200, media_type="application/a2a+json", headers={"Cache-Control": "no-store"})
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": {"code": 500, "message": "Internal error", "details": [{"reason": "INTERNAL", "message": type(exc).__name__}]}}, media_type="application/a2a+json")
 
@@ -1245,10 +1262,13 @@ def cancel_task_http(task_id: str, request: Request):
     err = version_error(request)
     if err:
         return err
-    media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if media and media not in {"application/a2a+json", "application/json"}:
-        return JSONResponse(status_code=415, content={"error": {"code": 415, "message": "Unsupported cancellation media type."}}, media_type="application/a2a+json")
-    return cancel_task(task_id)
+    err = require_a2a_media(request)
+    if err:
+        return err
+    canceled = cancel_task(task_id)
+    if isinstance(canceled, JSONResponse):
+        return canceled
+    return JSONResponse(content={"task": canceled}, status_code=200, media_type="application/a2a+json")
 
 
 @app.post("/tasks/cancel")
@@ -1265,4 +1285,7 @@ async def cancel_task_body(request: Request):
     task_id = norm(payload.get("id") or payload.get("taskId") or payload.get("task_id")) if isinstance(payload, dict) else ""
     if not task_id:
         return task_error(400, "A task id is required for cancellation.")
-    return cancel_task(task_id)
+    canceled = cancel_task(task_id)
+    if isinstance(canceled, JSONResponse):
+        return canceled
+    return JSONResponse(content={"task": canceled}, status_code=200, media_type="application/a2a+json")
