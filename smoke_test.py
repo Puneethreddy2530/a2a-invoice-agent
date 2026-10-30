@@ -58,16 +58,18 @@ def send_batch(mid="m-1", pkg=None, token=A):
 card=client.get("/.well-known/agent-card.json").json()
 assert card["skills"][0]["id"]=="invoice_action_agent"
 assert card["supportedInterfaces"][0]["protocolBinding"]=="HTTP+JSON"
-assert card["supportedInterfaces"][0]["url"].endswith("/")
+assert card["supportedInterfaces"][0]["url"].endswith("/a2a/")
+assert card["supportedInterfaces"][0]["url"]=="http://testserver/a2a/"
 assert BATCH in card["defaultInputModes"] and RESULTS in card["defaultInputModes"]
 assert main.PROPOSALS_MT in card["defaultOutputModes"] and main.RECEIPTS_MT in card["defaultOutputModes"]
 
 # Correct auth, version, media-type checks.
-assert client.get("/tasks").status_code==401
+assert client.get("/a2a/tasks").status_code==401
+assert client.get("/a2a/tasks",headers={"Authorization":A,"A2A-Version":"1.0"}).status_code==200
 assert client.get("/tasks",headers={"Authorization":"Basic x","A2A-Version":"1.0"}).status_code==401
 assert client.get("/tasks",headers={"Authorization":A,"A2A-Version":"2.0"}).status_code==400
-assert client.post("/message:send",headers={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/json"},json={}).status_code==415
-assert client.post("/message:send",headers={"Authorization":A,"A2A-Version":"2.0","Content-Type":"application/a2a+json"},json={}).status_code==400
+assert client.post("/a2a/message:send",headers={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/json"},json={}).status_code==415
+assert client.post("/a2a/message:send",headers={"Authorization":A,"A2A-Version":"2.0","Content-Type":"application/a2a+json"},json={}).status_code==400
 
 # Initial batch creates input-required proposal artifact.
 r,msg=send_batch()
