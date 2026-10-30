@@ -125,10 +125,11 @@ def init_db() -> None:
             updated_at TEXT NOT NULL
         )""")
         # Additive migrations keep existing deployed task state intact.
-        # PostgreSQL aborts the whole transaction after any SQL error. The
-        # old implementation caught duplicate-column errors and continued
-        # inside the aborted transaction, so the next CREATE TABLE failed.
-        # Use IF NOT EXISTS on PostgreSQL; inspect SQLite metadata first.
+        # PostgreSQL aborts the whole transaction after any SQL error.  The
+        # previous implementation caught duplicate-column errors and then
+        # continued issuing SQL in that aborted transaction, which made app
+        # startup fail at the next CREATE TABLE.  Use IF NOT EXISTS on
+        # PostgreSQL; inspect SQLite's table metadata before altering it.
         task_columns = [
             ("state", "TEXT NOT NULL DEFAULT 'TASK_STATE_COMPLETED'"),
             ("request_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -1106,7 +1107,29 @@ async def http_json_send(request: Request):
         task = process_invoice(params if isinstance(params, dict) else {}, message if isinstance(message, dict) else {})
         return JSONResponse(content=task, media_type="application/a2a+json", headers={"Cache-Control": "no-store"})
     except AgentError as exc:
-        return task_error(exc.http_status, f"{exc.code}: {exc}")
+        # HTTP+JSON message:send is an A2A task operation. Once transport,
+        # authentication, version and media type have been validated, domain
+        # conflicts are reported as a failed task with HTTP 200. This keeps
+        # the transport successful while making the rejected action explicit
+        # in the task result; importantly, no conflicting request is executed.
+        params_obj = params if isinstance(params, dict) else {}
+        msg_obj = message if isinstance(message, dict) else {}
+        task_id = norm(params_obj.get("taskId") or params_obj.get("task_id")) or str(uuid.uuid4())
+        context_id = norm(msg_obj.get("contextId") or params_obj.get("contextId") or params_obj.get("context_id")) or str(uuid.uuid4())
+        error_result = {
+            "action": "REJECTED",
+            "reason": str(exc),
+            "error": {"code": exc.code, "http_status": exc.http_status},
+            "payment": None,
+            "task_id": task_id,
+            "context_id": context_id,
+            "side_effects": "none",
+        }
+        rejected = make_task(
+            task_id, context_id, json.dumps(error_result, ensure_ascii=False),
+            error_result, "TASK_STATE_FAILED", [msg_obj] if msg_obj else []
+        )
+        return JSONResponse(content=rejected, status_code=200, media_type="application/a2a+json", headers={"Cache-Control": "no-store"})
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": {"code": 500, "message": "Internal error", "details": [{"reason": "INTERNAL", "message": type(exc).__name__}]}}, media_type="application/a2a+json")
 
