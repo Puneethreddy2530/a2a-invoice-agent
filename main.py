@@ -125,16 +125,28 @@ def init_db() -> None:
             updated_at TEXT NOT NULL
         )""")
         # Additive migrations keep existing deployed task state intact.
-        for column, declaration in [
+        # PostgreSQL aborts the whole transaction after any SQL error. The
+        # old implementation caught duplicate-column errors and continued
+        # inside the aborted transaction, so the next CREATE TABLE failed.
+        # Use IF NOT EXISTS on PostgreSQL; inspect SQLite metadata first.
+        task_columns = [
             ("state", "TEXT NOT NULL DEFAULT 'TASK_STATE_COMPLETED'"),
             ("request_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ("invoice_key", "TEXT"),
-        ]:
-            try:
-                conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {declaration}")
-            except Exception:
-                pass
+        ]
+        if DATABASE_URL.startswith(("postgres://", "postgresql://")):
+            for column, declaration in task_columns:
+                conn.execute(
+                    f"ALTER TABLE tasks ADD COLUMN IF NOT EXISTS {column} {declaration}"
+                )
+        else:
+            existing_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            for column, declaration in task_columns:
+                if column not in existing_columns:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {declaration}")
         conn.execute("""CREATE TABLE IF NOT EXISTS task_messages (
             message_id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL,
