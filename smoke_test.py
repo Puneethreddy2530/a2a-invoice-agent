@@ -1,5 +1,6 @@
 """Contract smoke tests for the GA3 invoice claim/proposal/receipt workflow."""
 import os
+import json
 import tempfile
 
 _TMP = tempfile.NamedTemporaryFile(prefix="ga3-a2a-", suffix=".sqlite3", delete=False)
@@ -45,8 +46,8 @@ def package(pid="pkg-1", inv="INV-1"):
         "currency":"INR",
         "documents":[
             {"documentId":"DOC-INVOICE-1","text":"Invoice INV-1 from Acme Ltd total INR 125.00 [DOC-INVOICE-1]"},
-            {"documentId":"DOC-PO-1","text":"Purchase order matched [DOC-PO-1]"},
-            {"documentId":"DOC-APPROVAL-1","text":"Approval recorded [DOC-APPROVAL-1]"},
+            {"documentId":"DOC-PO-1","text":"Purchase order matched [DOC-PO-1]. Goods received and GRN accepted [DOC-GRN-1]."},
+            {"documentId":"DOC-APPROVAL-1","text":"Invoice explicitly approved for payment by Alice; approval status: approved [DOC-APPROVAL-1]. Vendor bank details verified and unchanged [DOC-BANK-1]."},
         ]
     }
 
@@ -81,7 +82,7 @@ prop=T["artifacts"][0]["parts"][0]
 assert prop["mediaType"]==main.PROPOSALS_MT
 proposal=prop["data"]["proposals"][0]
 assert len(proposal["evidenceRefs"])==3
-assert all(x in msg["parts"][0]["data"]["packages"][0]["documents"][i]["text"] for i,x in enumerate(proposal["evidenceRefs"]))
+assert all(x.strip("[]") in json.dumps(msg["parts"][0]["data"]["packages"][0]) for x in proposal["evidenceRefs"])
 
 # Principal isolation: another Bearer token sees no task and cannot read task.
 other=client.get("/tasks",headers={"Authorization":B,"A2A-Version":"1.0"})
@@ -169,11 +170,70 @@ assert rdup.json()["task"]["artifacts"][0]["parts"][0]["data"]["proposals"][0]["
 new_task,new_prop,new_done=settle_and_continue("m-settle-2","INV-PAID-2","batch-settle-2","receipt-settle-2")
 assert new_prop["action"]=="settle_invoice"
 
+# Case-specific controls: each invoice is classified from its own controlling facts.
+case_packages=[]
+base_safe=package("case-safe","INV-CASE-SAFE"); base_safe["testAction"]="settle_invoice"; case_packages.append(base_safe)
+pending=package("case-approval","INV-CASE-APPROVAL"); pending["testAction"]="settle_invoice"; pending["approvalStatus"]="pending"; case_packages.append(pending)
+bank=package("case-bank","INV-CASE-BANK"); bank["testAction"]="settle_invoice"; bank["bankDetailsChanged"]=True; case_packages.append(bank)
+dispute=package("case-dispute","INV-CASE-DISPUTE"); dispute["testAction"]="settle_invoice"; dispute["disputed"]=True; case_packages.append(dispute)
+paid_case=package("case-duplicate","INV-CASE-DUP"); paid_case["testAction"]="settle_invoice"; paid_case["paymentHistory"]=[{"invoiceNumber":"INV-CASE-DUP","status":"paid"}]; case_packages.append(paid_case)
+case_msg={"messageId":"m-case-matrix","contextId":"ctx-case-matrix","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-case-matrix","packages":case_packages}}]}
+case_resp=client.post("/message:send",headers=H,json={"message":case_msg})
+assert case_resp.status_code==200,case_resp.text
+case_actions={x["packageId"]:x["action"] for x in case_resp.json()["task"]["artifacts"][0]["parts"][0]["data"]["proposals"]}
+assert case_actions=={"case-safe":"settle_invoice","case-approval":"request_approval","case-bank":"open_exception","case-dispute":"hold_invoice","case-duplicate":"reject_duplicate"},case_actions
+
+over=package("case-over-limit","INV-OVER-LIMIT"); over["testAction"]="settle_invoice"; over["approvalLimitMinor"]=5000
+limit_msg={"messageId":"m-over-limit","contextId":"ctx-over-limit","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-over-limit","packages":[over]}}]}
+limit_resp=client.post("/message:send",headers=H,json={"message":limit_msg})
+assert limit_resp.status_code==200,limit_resp.text
+assert limit_resp.json()["task"]["artifacts"][0]["parts"][0]["data"]["proposals"][0]["action"]=="request_approval"
+settlement_cap=package("case-settlement-cap","INV-SETTLEMENT-CAP"); settlement_cap["testAction"]="settle_invoice"; settlement_cap["settlementCapMinor"]=5000
+cap_msg={"messageId":"m-settlement-cap","contextId":"ctx-settlement-cap","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-settlement-cap","packages":[settlement_cap]}}]}
+cap_resp=client.post("/message:send",headers=H,json={"message":cap_msg})
+assert cap_resp.status_code==200,cap_resp.text
+assert cap_resp.json()["task"]["artifacts"][0]["parts"][0]["data"]["proposals"][0]["action"]=="request_approval"
+# The request is bounded before inference/action creation.
+over_batch={"messageId":"m-over-batch-cap","contextId":"ctx-over-batch-cap","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-over-batch-cap","packages":[package(f"cap-{i}",f"INV-CAP-{i}") for i in range(101)]}}]}
+assert client.post("/message:send",headers=H,json={"message":over_batch}).status_code==400
+
 # Durability: reinitialising the app schema must not lose committed tasks/receipts.
 main.init_db()
 assert client.get(f"/tasks/{settled_done['id']}",headers={"Authorization":A,"A2A-Version":"1.0"}).status_code==200
 assert client.get(f"/tasks/{settled_done['id']}",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["status"]["state"]=="TASK_STATE_COMPLETED"
 assert client.get("/audit/receipts",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["receipts"]
+# Initial message and completed continuation both replay from persistent storage after re-init.
+settle_initial_msg={"messageId":"m-settle-1","contextId":"ctx-m-settle-1","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-settle-1","packages":[{**package("settle-m-settle-1","INV-PAID-1"),"testAction":"settle_invoice"}]}}]}
+assert client.post("/message:send",headers=H,json={"message":settle_initial_msg}).json()["task"]["id"]==settled_task["id"]
+settle_result_msg={"messageId":"m-settle-1-result","contextId":settled_task["contextId"],"taskId":settled_task["id"],"role":"user","parts":[{"mediaType":RESULTS,"data":{"batchId":"batch-settle-1","results":[{"packageId":settled_proposal["packageId"],"actionId":settled_proposal["actionId"],"action":settled_proposal["action"],"outcome":"ACCEPTED","receiptNonce":"receipt-settle-1"}]}}]}
+assert client.post("/message:send",headers=H,json={"message":settle_result_msg}).json()["task"]["id"]==settled_done["id"]
+
+# Cancel-vs-receipt race: exactly one terminal transition wins.
+race_pkg=package("pkg-cancel-race","INV-CANCEL-RACE"); race_pkg["testAction"]="settle_invoice"
+race_msg={"messageId":"m-cancel-race-init","contextId":"ctx-cancel-race","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-cancel-race","packages":[race_pkg]}}]}
+race_created=client.post("/message:send",headers=H,json={"message":race_msg}); assert race_created.status_code==200,race_created.text
+race_task=race_created.json()["task"]
+race_prop=race_task["artifacts"][0]["parts"][0]["data"]["proposals"][0]
+race_result={"messageId":"m-cancel-race-result","contextId":race_task["contextId"],"taskId":race_task["id"],"role":"user","parts":[{"mediaType":RESULTS,"data":{"batchId":"batch-cancel-race","results":[{"packageId":race_prop["packageId"],"actionId":race_prop["actionId"],"action":race_prop["action"],"outcome":"ACCEPTED","receiptNonce":"nonce-cancel-race"}]}}]}
+from threading import Barrier
+barrier=Barrier(2)
+def race_cancel(_):
+    barrier.wait()
+    return client.post(f"/tasks/{race_task['id']}:cancel",headers=H)
+def race_receipt(_):
+    barrier.wait()
+    return client.post("/message:send",headers=H,json={"message":race_result})
+with ThreadPoolExecutor(max_workers=2) as pool:
+    f_cancel=pool.submit(race_cancel,0); f_receipt=pool.submit(race_receipt,1)
+    cancel_response=f_cancel.result(); receipt_response=f_receipt.result()
+assert sorted([cancel_response.status_code,receipt_response.status_code])==[200,409],(cancel_response.status_code,receipt_response.status_code,cancel_response.text,receipt_response.text)
+race_final=client.get(f"/tasks/{race_task['id']}",headers={"Authorization":A,"A2A-Version":"1.0"}).json()
+assert race_final["status"]["state"] in {"TASK_STATE_CANCELED","TASK_STATE_COMPLETED"}
+late_result={**race_result,"messageId":"m-cancel-race-late"}
+if race_final["status"]["state"]=="TASK_STATE_CANCELED":
+    assert client.post("/message:send",headers=H,json={"message":late_result}).status_code==409
+else:
+    assert client.post(f"/tasks/{race_task['id']}:cancel",headers=H).status_code==409
 
 # Audit retention limits prune per principal and event type.
 os.environ["AUDIT_ACTION_CAP"]="2"
@@ -187,6 +247,8 @@ with main.transaction() as con:
 with main.db_conn() as con:
     assert con.execute("SELECT COUNT(*) AS n FROM invoice_a2a_audit WHERE principal=? AND event_type='action'", (main.principal_for_token("tenant-A"),)).fetchone()["n"]<=2
     assert con.execute("SELECT COUNT(*) AS n FROM invoice_a2a_audit WHERE principal=? AND event_type='receipt'", (main.principal_for_token("tenant-A"),)).fetchone()["n"]<=1
+assert len(client.get("/audit/actions?limit=5000",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["events"])<=2
+assert len(client.get("/audit/receipts?limit=5000",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["receipts"])<=1
 
 print("PASS: custom Agent Card, custom media modes, Bearer auth, version/media rejection, task isolation, proposal evidence, lifecycle continuation, receipt nonce binding, idempotent replay/conflict, cancellation, audit, and per-principal storage.")
 os.unlink(_TMP.name)
