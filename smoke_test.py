@@ -1,184 +1,190 @@
-"""Local protocol, lifecycle, audit, and idempotent payment regression tests."""
+"""Contract smoke tests for the GA3 invoice claim/proposal/receipt workflow."""
 import os
 import tempfile
-import threading
-from collections import Counter
 
-_tmp = tempfile.NamedTemporaryFile(prefix="invoice-agent-", suffix=".sqlite3", delete=False)
-_tmp.close()
-os.environ["DATABASE_PATH"] = _tmp.name
+_TMP = tempfile.NamedTemporaryFile(prefix="ga3-a2a-", suffix=".sqlite3", delete=False)
+_TMP.close()
+os.environ["DATABASE_PATH"] = _TMP.name
 os.environ.pop("DATABASE_URL", None)
-os.environ.pop("A2A_API_TOKEN", None)
 
-import main  # noqa: E402
+import main
 main.init_db()
 
+# Provide deterministic AI output for protocol/lifecycle tests. The test still
+# verifies that evidence IDs are source-grounded and validated by the agent.
+async def fake_model(packages):
+    proposals=[]
+    for p in packages:
+        refs=main.collect_evidence_refs(p)
+        action=p.get("testAction", "hold_invoice")
+        proposals.append({
+            "packageId":p["packageId"],
+            "action":action,
+            "facts":{"vendorName":p.get("vendorName", "Acme Ltd"),"invoiceNumber":p["invoiceNumber"],"amountMinor":int(p.get("amountMinor",12500)),"currency":p.get("currency", "INR")},
+            "evidenceRefs":refs[:3],
+            "rationale":f"{refs[0]} identifies the invoice record; {refs[1]} is the supporting purchase-order evidence; {refs[2]} gives independent approval context. The proposal is {action} based on the package controls.",
+        })
+    return proposals
+main.call_model=fake_model
 
-def submit(message_id: str, invoice_number: str, amount: str, limit: str, approval: str = "approved for payment"):
-    text = (
-        "Acme Supplies\n"
-        f"Invoice Number: {invoice_number}\n"
-        f"Invoice Total: USD {amount}\n"
-        f"Approval limit: USD {limit}\n"
-        f"Invoice {approval} by Finance Manager."
-    )
-    message = {"messageId": message_id, "contextId": "smoke-test-context", "role": "user", "parts": [{"text": text}]}
-    return main.process_invoice({"message": message}, message)
+from fastapi.testclient import TestClient
+client=TestClient(main.app)
 
+A="Bearer tenant-A"
+B="Bearer tenant-B"
+H={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/a2a+json"}
+BATCH=main.BATCH_MT
+RESULTS=main.RESULTS_MT
 
-def data(task):
-    return task["artifacts"][0]["parts"][0]["data"]
+def package(pid="pkg-1", inv="INV-1"):
+    return {
+        "packageId":pid,
+        "invoiceNumber":inv,
+        "vendorName":"Acme Ltd",
+        "amountMinor":12500,
+        "currency":"INR",
+        "documents":[
+            {"documentId":"DOC-INVOICE-1","text":"Invoice INV-1 from Acme Ltd total INR 125.00 [DOC-INVOICE-1]"},
+            {"documentId":"DOC-PO-1","text":"Purchase order matched [DOC-PO-1]"},
+            {"documentId":"DOC-APPROVAL-1","text":"Approval recorded [DOC-APPROVAL-1]"},
+        ]
+    }
 
+def send_batch(mid="m-1", pkg=None, token=A):
+    msg={"messageId":mid,"contextId":"ctx-1","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-1","packages":[pkg or package()]}}]}
+    return client.post("/message:send",headers={"Authorization":token,"A2A-Version":"1.0","Content-Type":"application/a2a+json"},json={"message":msg}),msg
 
-# Payment receipt, identity-based duplicate, and distinct invoice with same amount.
-first = submit("req-1", "INV-100", "450.00", "500.00")
-assert data(first)["action"] == "PAY", data(first)
-receipt = data(first)["payment"]["receipt"]
-assert receipt["receipt_id"] and receipt["invoice_binding"]["invoice_number"] == "INV-100"
-assert data(first)["evidence_ids"] and data(first)["decision_basis"]
-assert data(first)["deduplication"]["amount_is_part_of_identity"] is False
+# Public card shape and exact custom GA5 modes.
+card=client.get("/.well-known/agent-card.json").json()
+assert card["skills"][0]["id"]=="invoice_action_agent"
+assert card["supportedInterfaces"][0]["protocolBinding"]=="HTTP+JSON"
+assert card["supportedInterfaces"][0]["url"].endswith("/")
+assert BATCH in card["defaultInputModes"] and RESULTS in card["defaultInputModes"]
+assert main.PROPOSALS_MT in card["defaultOutputModes"] and main.RECEIPTS_MT in card["defaultOutputModes"]
 
-same_invoice = submit("req-2", "INV-100", "450.00", "500.00", "not approved")
-assert data(same_invoice)["action"] == "DO_NOT_PAY_DUPLICATE", data(same_invoice)
-assert data(same_invoice)["payment"]["receipt"]["receipt_id"] == receipt["receipt_id"]
+# Correct auth, version, media-type checks.
+assert client.get("/tasks").status_code==401
+assert client.get("/tasks",headers={"Authorization":"Basic x","A2A-Version":"1.0"}).status_code==401
+assert client.get("/tasks",headers={"Authorization":A,"A2A-Version":"2.0"}).status_code==400
+assert client.post("/message:send",headers={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/json"},json={}).status_code==415
+assert client.post("/message:send",headers={"Authorization":A,"A2A-Version":"2.0","Content-Type":"application/a2a+json"},json={}).status_code==400
 
-same_amount_new_invoice = submit("req-3", "INV-101", "450.00", "500.00")
-assert data(same_amount_new_invoice)["action"] == "PAY", data(same_amount_new_invoice)
-assert data(same_amount_new_invoice)["payment"]["receipt"]["receipt_id"] != receipt["receipt_id"]
+# Initial batch creates input-required proposal artifact.
+r,msg=send_batch()
+assert r.status_code==200,r.text
+body=r.json(); assert "task" in body
+T=body["task"]
+assert T["status"]["state"]=="TASK_STATE_INPUT_REQUIRED"
+prop=T["artifacts"][0]["parts"][0]
+assert prop["mediaType"]==main.PROPOSALS_MT
+proposal=prop["data"]["proposals"][0]
+assert len(proposal["evidenceRefs"])==3
+assert all(x in msg["parts"][0]["data"]["packages"][0]["documents"][i]["text"] for i,x in enumerate(proposal["evidenceRefs"]))
 
-over_limit = submit("req-4", "INV-102", "900.00", "500.00")
-assert data(over_limit)["action"] == "REQUEST_APPROVAL", data(over_limit)
-assert over_limit["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+# Principal isolation: another Bearer token sees no task and cannot read task.
+other=client.get("/tasks",headers={"Authorization":B,"A2A-Version":"1.0"})
+assert other.status_code==200 and other.json()["tasks"]==[]
+assert client.get(f"/tasks/{T['id']}",headers={"Authorization":B,"A2A-Version":"1.0"}).status_code==404
+assert client.get("/tasks",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["tasks"]
 
-# Same messageId + same payload is a persistent replay; different payload conflicts.
-message = {"messageId": "req-5", "contextId": "smoke-test-context", "role": "user", "parts": [{"text": "Acme Supplies\nInvoice Number: INV-105\nInvoice Total: USD 25\nInvoice approved for payment. Approval limit: USD 30"}]}
-replay_task = main.process_invoice({"message": message}, message)
-replay_again = main.process_invoice({"message": message}, message)
-assert replay_task["id"] == replay_again["id"]
-conflicting = {"messageId": "req-5", "contextId": "smoke-test-context", "role": "user", "parts": [{"text": "Different request"}]}
-try:
-    main.process_invoice({"message": conflicting}, conflicting)
-    raise AssertionError("reused messageId with a different body was accepted")
-except main.AgentError as exc:
-    assert exc.code == "IDEMPOTENCY_KEY_REUSED"
+# Same message/payload replays exact task; conflicting payload cannot create another task.
+replay=client.post("/message:send",headers=H,json={"message":msg})
+assert replay.status_code==200 and replay.json()["task"]["id"]==T["id"]
+conflict_msg={**msg,"parts":[{"mediaType":BATCH,"data":{"batchId":"batch-1","packages":[package(inv="INV-OTHER")]}}]}
+conflict=client.post("/message:send",headers=H,json={"message":conflict_msg})
+assert conflict.status_code==409
 
-# Continue an approval-required task with approval evidence; same task id, same context.
-initial_msg = {"messageId": "req-6", "contextId": "continuation-context", "role": "user", "parts": [{"text": "Acme Supplies\nInvoice Number: INV-106\nInvoice Total: USD 200\nApproval limit: USD 250"}]}
-waiting = main.process_invoice({"message": initial_msg}, initial_msg)
-assert waiting["status"]["state"] == "TASK_STATE_INPUT_REQUIRED", waiting
-approval_msg = {"messageId": "req-7", "contextId": "continuation-context", "role": "user", "parts": [{"text": "Invoice INV-106 approved for payment by Finance Manager."}]}
-continued = main.process_invoice({"taskId": waiting["id"], "contextId": "continuation-context", "message": approval_msg}, approval_msg)
-assert continued["id"] == waiting["id"]
-assert data(continued)["action"] == "PAY", data(continued)
+# Correct continuation accepts exact actionId + action + nonce and stores receipt artifact.
+result_msg={"messageId":"m-2","contextId":T["contextId"],"taskId":T["id"],"role":"user","parts":[{"mediaType":RESULTS,"data":{"batchId":"batch-1","results":[{"packageId":proposal["packageId"],"actionId":proposal["actionId"],"action":proposal["action"],"outcome":"ACCEPTED","receiptNonce":"nonce-1"}]}}]}
+continued=client.post("/message:send",headers=H,json={"message":result_msg})
+assert continued.status_code==200,continued.text
+CT=continued.json()["task"]
+assert CT["status"]["state"]=="TASK_STATE_COMPLETED"
+receipt=CT["artifacts"][-1]["parts"][0]
+assert receipt["mediaType"]==main.RECEIPTS_MT
+assert receipt["data"]["executions"][0]["receiptNonce"]=="nonce-1"
+# Terminal replay returns exact completed task; terminal task rejects new continuation.
+assert client.post("/message:send",headers=H,json={"message":result_msg}).json()["task"]["id"]==T["id"]
+invalid={**result_msg,"messageId":"m-3"}
+assert client.post("/message:send",headers=H,json={"message":invalid}).status_code==409
 
-# Invalid continuation on a completed task must be rejected.
-try:
-    main.process_invoice({"taskId": first["id"], "contextId": first["contextId"], "message": {"messageId": "req-8", "parts": [{"text": "try to continue"}]}}, {"messageId": "req-8", "parts": [{"text": "try to continue"}]})
-    raise AssertionError("completed task accepted a continuation")
-except main.AgentError as exc:
-    assert exc.code == "INVALID_CONTINUATION"
+# Cancellation protected and state transitions only from input-required.
+r,msg2=send_batch("m-4",package("pkg-2","INV-2"))
+T2=r.json()["task"]
+assert client.post(f"/tasks/{T2['id']}:cancel",headers={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/a2a+json"}).status_code==200
+assert client.get(f"/tasks/{T2['id']}",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["status"]["state"]=="TASK_STATE_CANCELED"
+assert client.post(f"/tasks/{T2['id']}:cancel",headers={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/a2a+json"}).status_code==409
+assert client.post(f"/tasks/{T['id']}:cancel",headers={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/a2a+json"}).status_code==409
 
-# Task cancel is allowed for input-required work but cannot cancel a paid task.
-canceled = main.cancel_task(waiting["id"] + "-not-found")
-assert hasattr(canceled, "status_code") and canceled.status_code == 404
-blocked_cancel = main.cancel_task(first["id"])
-assert hasattr(blocked_cancel, "status_code") and blocked_cancel.status_code == 409
-cancel_msg = {"messageId": "req-cancel", "contextId": "cancel-context", "role": "user", "parts": [{"text": "Acme Supplies\nInvoice Number: INV-CANCEL\nInvoice Total: USD 10\nApproval limit: USD 50"}]}
-cancel_waiting = main.process_invoice({"message": cancel_msg}, cancel_msg)
-assert cancel_waiting["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
-cancelled = main.cancel_task(cancel_waiting["id"])
-assert cancelled["status"]["state"] == "TASK_STATE_CANCELED"
+# Invalid/incomplete receipt batches leave the task INPUT_REQUIRED.
+r,msg3=send_batch("m-5",package("pkg-3","INV-3")); T3=r.json()["task"]
+p3=T3["artifacts"][0]["parts"][0]["data"]["proposals"][0]
+bad_msg={"messageId":"m-6","contextId":T3["contextId"],"taskId":T3["id"],"role":"user","parts":[{"mediaType":RESULTS,"data":{"batchId":"batch-1","results":[]}}]}
+assert client.post("/message:send",headers=H,json={"message":bad_msg}).status_code==409
+assert client.get(f"/tasks/{T3['id']}",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["status"]["state"]=="TASK_STATE_INPUT_REQUIRED"
 
-# Auth and protocol-level checks via ASGI test client.
-try:
-    from fastapi.testclient import TestClient
-    client = TestClient(main.app)
-    assert client.get("/tasks").status_code == 401
-    assert client.post("/message:send", json={}).status_code == 401
-    card = client.get("/.well-known/agent-card.json").json()
-    assert card["supportedInterfaces"][0]["url"].endswith("/")
-    assert card["url"].endswith("/")
-    assert any(skill["id"] == "invoice-processing" for skill in card["skills"])
-    assert "application/a2a+json" in card["defaultInputModes"]
-    assert card["skills"] and card["securityRequirements"]
-    assert card["supportedInterfaces"][0]["protocolBinding"] == "HTTP+JSON"
-    assert card["supportedInterfaces"][0]["url"].endswith("/")
-    assert client.post("/message:send", headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"}, json={}).status_code == 415
-    assert client.post("/message:send", headers={"Authorization": "Bearer test-token", "Content-Type": "application/a2a+json", "A2A-Version": "99.0"}, content=b"{}").status_code == 400
-    assert client.get("/tasks", headers={"Authorization": "Bearer test-token"}).status_code == 200
-    assert client.post("/tasks/not-a-task:cancel").status_code == 401
-    assert client.post("/tasks/cancel", headers={"Authorization": "Bearer test-token", "Content-Type": "application/a2a+json"}, json={"id": "missing"}).status_code == 404
-    # Domain conflicts on HTTP+JSON message:send remain A2A task responses
-    # (HTTP 200) with a failed task and explicit error payload, not transport 409.
-    h = {"Authorization": "Bearer test-token", "Content-Type": "application/a2a+json", "A2A-Version": "1.0"}
-    body_a = {"message": {"messageId": "http-conflict-1", "contextId": "http-conflict", "role": "user", "parts": [{"text": "first payload"}]}}
-    first_http = client.post("/message:send", headers=h, json=body_a)
-    assert first_http.status_code == 200, first_http.text
-    assert "task" in first_http.json(), first_http.text
-    body_b = {"message": {"messageId": "http-conflict-1", "contextId": "http-conflict", "role": "user", "parts": [{"text": "different payload"}]}}
-    conflict_http = client.post("/message:send", headers=h, json=body_b)
-    assert conflict_http.status_code == 200, conflict_http.text
-    assert "task" in conflict_http.json(), conflict_http.text
-    conflict_task = conflict_http.json()["task"]
-    conflict_data = conflict_task["artifacts"][0]["parts"][0]["data"]
-    assert conflict_task["status"]["state"] == "TASK_STATE_FAILED"
-    assert conflict_data["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
-    assert conflict_data["side_effects"] == "none"
-    invalid_continuation = client.post("/message:send", headers=h, json={"taskId": first["id"], "message": {"messageId": "http-invalid-cont", "contextId": first["contextId"], "parts": [{"text": "should not continue"}]}})
-    assert invalid_continuation.status_code == 409, invalid_continuation.text
-except Exception as exc:
-    if exc.__class__.__name__ == "TypeError" and "TestClient" in str(exc):
-        print("NOTE: ASGI TestClient is unavailable in this environment; protocol checks skipped.")
-    else:
-        raise
+# Authenticated audit and isolation probes are principal scoped.
+assert client.get("/audit/actions",headers={"Authorization":A,"A2A-Version":"1.0"}).status_code==200
+assert client.get("/audit/receipts",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["receipts"]
+assert client.get("/isolation-probe",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["cross_principal_reads"] is False
 
-# Persisted replay survives database reinitialization (as on process restart).
+# Concurrent identical initial messages converge to one stored task.
+from concurrent.futures import ThreadPoolExecutor
+concurrent_message={"messageId":"m-concurrent","contextId":"ctx-concurrent","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-concurrent","packages":[package("pkg-concurrent","INV-CONCURRENT")]}}]}
+def post_concurrent_initial(_):
+    return client.post("/message:send",headers=H,json={"message":concurrent_message})
+with ThreadPoolExecutor(max_workers=4) as pool:
+    concurrent_responses=list(pool.map(post_concurrent_initial,range(4)))
+assert all(x.status_code==200 for x in concurrent_responses),[x.text for x in concurrent_responses]
+concurrent_ids={x.json()["task"]["id"] for x in concurrent_responses}
+assert len(concurrent_ids)==1,concurrent_ids
+
+# Accepted settlement is recorded only after the caller supplies the result nonce.
+def settle_and_continue(mid, invoice_number, batch_id, nonce):
+    pkg=package(f"settle-{mid}", invoice_number)
+    pkg["testAction"]="settle_invoice"
+    msg={"messageId":mid,"contextId":f"ctx-{mid}","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":batch_id,"packages":[pkg]}}]}
+    created=client.post("/message:send",headers=H,json={"message":msg})
+    assert created.status_code==200,created.text
+    task=created.json()["task"]
+    proposal=task["artifacts"][0]["parts"][0]["data"]["proposals"][0]
+    assert proposal["action"]=="settle_invoice",proposal
+    result={"messageId":mid+"-result","contextId":task["contextId"],"taskId":task["id"],"role":"user","parts":[{"mediaType":RESULTS,"data":{"batchId":batch_id,"results":[{"packageId":proposal["packageId"],"actionId":proposal["actionId"],"action":proposal["action"],"outcome":"ACCEPTED","receiptNonce":nonce}]}}]}
+    done=client.post("/message:send",headers=H,json={"message":result})
+    assert done.status_code==200,done.text
+    return task, proposal, done.json()["task"]
+
+# Persisted accepted same invoice identity is a duplicate, but a different invoice number with the same amount is not.
+settled_task, settled_proposal, settled_done=settle_and_continue("m-settle-1","INV-PAID-1","batch-settle-1","receipt-settle-1")
+assert settled_done["status"]["state"]=="TASK_STATE_COMPLETED"
+# Build a new package with the exact same vendor and invoice number.
+pdup=package("pkg-dup","INV-PAID-1"); pdup["testAction"]="settle_invoice"
+md={"messageId":"m-dup","contextId":"ctx-dup","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-dup","packages":[pdup]}}]}
+rdup=client.post("/message:send",headers=H,json={"message":md})
+assert rdup.status_code==200,rdup.text
+assert rdup.json()["task"]["artifacts"][0]["parts"][0]["data"]["proposals"][0]["action"]=="reject_duplicate"
+# Same amount and vendor, different invoice number remains independently payable.
+new_task,new_prop,new_done=settle_and_continue("m-settle-2","INV-PAID-2","batch-settle-2","receipt-settle-2")
+assert new_prop["action"]=="settle_invoice"
+
+# Durability: reinitialising the app schema must not lose committed tasks/receipts.
 main.init_db()
-assert main.process_invoice({"message": message}, message)["id"] == replay_task["id"]
+assert client.get(f"/tasks/{settled_done['id']}",headers={"Authorization":A,"A2A-Version":"1.0"}).status_code==200
+assert client.get(f"/tasks/{settled_done['id']}",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["status"]["state"]=="TASK_STATE_COMPLETED"
+assert client.get("/audit/receipts",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["receipts"]
 
-# Concurrent copies of the same invoice can reserve/settle at most once.
-barrier = threading.Barrier(6)
-race_results = []
-race_errors = []
-def race_worker(index):
-    msg = {"messageId": f"race-{index}", "contextId": "race-context", "role": "user", "parts": [{"text": "Acme Race Supplies\nInvoice Number: RACE-777\nInvoice Total: USD 77.00\nApproval limit: USD 100.00\nInvoice RACE-777 approved for payment."}]}
-    try:
-        barrier.wait()
-        task = main.process_invoice({"message": msg}, msg)
-        race_results.append(data(task))
-    except Exception as exc:
-        race_errors.append(repr(exc))
-threads = [threading.Thread(target=race_worker, args=(i,)) for i in range(6)]
-for thread in threads: thread.start()
-for thread in threads: thread.join()
-assert not race_errors and len(race_results) == 6, race_errors
-assert sum(item["action"] == "PAY" for item in race_results) == 1, Counter(item["action"] for item in race_results)
-assert all(item["action"] in {"PAY", "DO_NOT_PAY_DUPLICATE", "HOLD_FOR_RECONCILIATION"} for item in race_results)
-receipts = {
-    item.get("payment", {}).get("receipt", {}).get("receipt_id")
-    for item in race_results
-    if isinstance(item.get("payment", {}).get("receipt"), dict)
-    and item["payment"]["receipt"].get("receipt_id")
-}
-assert len(receipts) == 1, receipts
+# Audit retention limits prune per principal and event type.
+os.environ["AUDIT_ACTION_CAP"]="2"
+os.environ["AUDIT_RECEIPT_CAP"]="1"
+with main.transaction() as con:
+    for i in range(5):
+        main.add_audit(con, main.principal_for_token("tenant-A"), "action", "cap-task", f"p{i}", "hold_invoice", None, {"i":i})
+        main.add_audit(con, main.principal_for_token("tenant-A"), "receipt", "cap-task", f"p{i}", "hold_invoice", f"n{i}", {"i":i})
+    main.prune_audit(con, main.principal_for_token("tenant-A"), "action")
+    main.prune_audit(con, main.principal_for_token("tenant-A"), "receipt")
+with main.db_conn() as con:
+    assert con.execute("SELECT COUNT(*) AS n FROM invoice_a2a_audit WHERE principal=? AND event_type='action'", (main.principal_for_token("tenant-A"),)).fetchone()["n"]<=2
+    assert con.execute("SELECT COUNT(*) AS n FROM invoice_a2a_audit WHERE principal=? AND event_type='receipt'", (main.principal_for_token("tenant-A"),)).fetchone()["n"]<=1
 
-# Audit retention caps are enforced independently for actions and receipts.
-os.environ["AUDIT_ACTION_CAP"] = "2"
-os.environ["AUDIT_RECEIPT_CAP"] = "1"
-for n in range(5):
-    main.write_audit("action", None, None, f"CAP_TEST_{n}", {})
-for n in range(3):
-    main.write_audit("receipt", None, None, "CAP_RECEIPT", {"receipt_id": f"cap-{n}"})
-with main.db_conn() as conn:
-    assert conn.execute("SELECT COUNT(*) AS n FROM audit_events WHERE event_type='action'").fetchone()["n"] <= 2
-    assert conn.execute("SELECT COUNT(*) AS n FROM audit_events WHERE event_type='receipt'").fetchone()["n"] <= 1
-
-assert main.isolation_probe()["available"] is True
-assert len(main.audit_actions(type("R", (), {"headers": {"authorization": "Bearer test-token"}})())["events"]) >= 1
-assert len(main.audit_receipts(type("R", (), {"headers": {"authorization": "Bearer test-token"}})())["receipts"]) >= 1
-print("PASS: receipt binding, identity dedupe, distinct-invoice payment, approval continuation, idempotency conflict, persistent replay, task lifecycle, cancellation safety, Bearer auth, A2A media/version rejection, bounded audit, isolation probe and concurrent exactly-once settlement.")
-
-try:
-    os.unlink(_tmp.name)
-except OSError:
-    pass
+print("PASS: custom Agent Card, custom media modes, Bearer auth, version/media rejection, task isolation, proposal evidence, lifecycle continuation, receipt nonce binding, idempotent replay/conflict, cancellation, audit, and per-principal storage.")
+os.unlink(_TMP.name)
