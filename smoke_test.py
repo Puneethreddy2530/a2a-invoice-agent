@@ -82,13 +82,19 @@ prop=T["artifacts"][0]["parts"][0]
 assert prop["mediaType"]==main.PROPOSALS_MT
 proposal=prop["data"]["proposals"][0]
 assert len(proposal["evidenceRefs"])==3
-assert all(x.strip("[]") in json.dumps(msg["parts"][0]["data"]["packages"][0]) for x in proposal["evidenceRefs"])
+assert proposal["evidenceRefs"] == ["DOC-INVOICE-1", "DOC-PO-1", "DOC-APPROVAL-1"], proposal["evidenceRefs"]
+assert all(not x.startswith("[") for x in proposal["evidenceRefs"])
+assert all(x in json.dumps(msg["parts"][0]["data"]["packages"][0]) for x in proposal["evidenceRefs"])
 
 # Principal isolation: another Bearer token sees no task and cannot read task.
 other=client.get("/tasks",headers={"Authorization":B,"A2A-Version":"1.0"})
 assert other.status_code==200 and other.json()["tasks"]==[]
 assert client.get(f"/tasks/{T['id']}",headers={"Authorization":B,"A2A-Version":"1.0"}).status_code==404
-assert client.get("/tasks",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["tasks"]
+owner_list=client.get("/a2a/tasks?pageSize=5",headers={"Authorization":A,"A2A-Version":"1.0"})
+assert owner_list.status_code==200 and owner_list.json()["tasks"]
+assert all("history" not in t and "artifacts" not in t for t in owner_list.json()["tasks"])
+assert client.get("/a2a/isolation-probe").json()["available"] is True
+assert client.get("/a2a/tasks").status_code==401
 
 # Same message/payload replays exact task; conflicting payload cannot create another task.
 replay=client.post("/message:send",headers=H,json={"message":msg})
@@ -116,6 +122,8 @@ r,msg2=send_batch("m-4",package("pkg-2","INV-2"))
 T2=r.json()["task"]
 assert client.post(f"/tasks/{T2['id']}:cancel",headers={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/a2a+json"}).status_code==200
 assert client.get(f"/tasks/{T2['id']}",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["status"]["state"]=="TASK_STATE_CANCELED"
+canceled_replay=client.post("/message:send",headers=H,json={"message":msg2}).json()["task"]
+assert canceled_replay["status"]["state"]=="TASK_STATE_CANCELED"
 assert client.post(f"/tasks/{T2['id']}:cancel",headers={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/a2a+json"}).status_code==409
 assert client.post(f"/tasks/{T['id']}:cancel",headers={"Authorization":A,"A2A-Version":"1.0","Content-Type":"application/a2a+json"}).status_code==409
 
@@ -204,7 +212,9 @@ assert client.get(f"/tasks/{settled_done['id']}",headers={"Authorization":A,"A2A
 assert client.get("/audit/receipts",headers={"Authorization":A,"A2A-Version":"1.0"}).json()["receipts"]
 # Initial message and completed continuation both replay from persistent storage after re-init.
 settle_initial_msg={"messageId":"m-settle-1","contextId":"ctx-m-settle-1","role":"user","parts":[{"mediaType":BATCH,"data":{"batchId":"batch-settle-1","packages":[{**package("settle-m-settle-1","INV-PAID-1"),"testAction":"settle_invoice"}]}}]}
-assert client.post("/message:send",headers=H,json={"message":settle_initial_msg}).json()["task"]["id"]==settled_task["id"]
+settle_initial_replay=client.post("/message:send",headers=H,json={"message":settle_initial_msg}).json()["task"]
+assert settle_initial_replay["id"]==settled_task["id"]
+assert settle_initial_replay["status"]["state"]=="TASK_STATE_COMPLETED"
 settle_result_msg={"messageId":"m-settle-1-result","contextId":settled_task["contextId"],"taskId":settled_task["id"],"role":"user","parts":[{"mediaType":RESULTS,"data":{"batchId":"batch-settle-1","results":[{"packageId":settled_proposal["packageId"],"actionId":settled_proposal["actionId"],"action":settled_proposal["action"],"outcome":"ACCEPTED","receiptNonce":"receipt-settle-1"}]}}]}
 assert client.post("/message:send",headers=H,json={"message":settle_result_msg}).json()["task"]["id"]==settled_done["id"]
 
