@@ -706,7 +706,12 @@ async def send_message_impl(request: Request, authorization: str | None) -> JSON
 
 @app.get("/")
 def root():
-    return {"name": APP_NAME, "version": APP_VERSION, "agentCard": "/.well-known/agent-card.json", "messageSend": "/message:send"}
+    return {"name": APP_NAME, "version": APP_VERSION, "agentCard": "/.well-known/agent-card.json", "a2aBase": "/a2a/", "messageSend": "/a2a/message:send"}
+
+
+@app.get("/a2a/")
+def a2a_root():
+    return {"name": APP_NAME, "version": APP_VERSION, "messageSend": "/a2a/message:send", "tasks": "/a2a/tasks"}
 
 
 @app.get("/health")
@@ -721,7 +726,7 @@ def health():
 
 @app.get("/.well-known/agent-card.json")
 def agent_card(request: Request):
-    base = public_origin(request) + "/"
+    base = public_origin(request) + "/a2a/"
     return {
         "name": APP_NAME,
         "description": "Reviews invoice claim batches, proposes evidence-grounded actions, and completes only actions acknowledged with valid receipt nonces. All tasks and retries are isolated by Bearer principal.",
@@ -753,6 +758,7 @@ def protected_task_row(task_id: str, principal: str):
     return row
 
 
+@app.get("/a2a/tasks")
 @app.get("/tasks")
 def list_tasks(request: Request, authorization: str | None = Header(default=None)):
     principal = auth_principal(authorization)
@@ -762,6 +768,7 @@ def list_tasks(request: Request, authorization: str | None = Header(default=None
     return JSONResponse({"tasks": [json.loads(r["task_json"]) for r in rows]}, media_type=A2A_MT, headers={"Cache-Control": "no-store"})
 
 
+@app.get("/a2a/tasks/{task_id}")
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str, request: Request, authorization: str | None = Header(default=None)):
     principal = auth_principal(authorization)
@@ -797,6 +804,7 @@ def cancel_task_for_principal(task_id: str, principal: str) -> dict:
     return task
 
 
+@app.post("/a2a/tasks/{task_id}:cancel")
 @app.post("/tasks/{task_id}:cancel")
 async def cancel_task(task_id: str, request: Request, authorization: str | None = Header(default=None)):
     principal = auth_principal(authorization)
@@ -818,6 +826,7 @@ async def cancel_task_body(request: Request, authorization: str | None = Header(
     return response_task(cancel_task_for_principal(task_id, principal))
 
 
+@app.get("/a2a/audit/actions")
 @app.get("/audit/actions")
 def audit_actions(request: Request, authorization: str | None = Header(default=None), limit: int = 100):
     principal = auth_principal(authorization)
@@ -828,6 +837,7 @@ def audit_actions(request: Request, authorization: str | None = Header(default=N
     return {"events": [{"event_id": r["event_id"], "task_id": r["task_id"], "package_id": r["package_id"], "action": r["action"], "payload": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "retention_cap": int(os.getenv("AUDIT_ACTION_CAP", "500"))}
 
 
+@app.get("/a2a/audit/receipts")
 @app.get("/audit/receipts")
 def audit_receipts(request: Request, authorization: str | None = Header(default=None), limit: int = 100):
     principal = auth_principal(authorization)
@@ -838,6 +848,7 @@ def audit_receipts(request: Request, authorization: str | None = Header(default=
     return {"receipts": [{"event_id": r["event_id"], "task_id": r["task_id"], "package_id": r["package_id"], "action": r["action"], "receipt_nonce": r["receipt_nonce"], "receipt": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "retention_cap": int(os.getenv("AUDIT_RECEIPT_CAP", "200"))}
 
 
+@app.get("/a2a/isolation-probe")
 @app.get("/isolation-probe")
 @app.get("/admin/isolation-probe")
 def isolation_probe(request: Request, authorization: str | None = Header(default=None)):
