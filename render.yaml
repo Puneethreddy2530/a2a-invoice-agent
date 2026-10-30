@@ -10,8 +10,10 @@ services:
       - key: LLM_API_KEY
         sync: false
       - key: LLM_MODEL
-        value: gpt-4o-mini
+        value: openai/gpt-4.1-nano
       - key: LLM_BASE_URL
-        value: https://api.openai.com/v1
+        value: https://aipipe.org/openrouter/v1
+      - key: A2A_API_TOKEN
+        sync: false
       - key: AUTO_APPROVAL_LIMIT
         value: ""
