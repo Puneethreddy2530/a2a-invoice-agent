@@ -100,7 +100,9 @@ try:
     assert card["url"].endswith("/")
     assert any(skill["id"] == "invoice-processing" for skill in card["skills"])
     assert "application/a2a+json" in card["defaultInputModes"]
-    assert card["skills"] and card["security"]
+    assert card["skills"] and card["securityRequirements"]
+    assert card["supportedInterfaces"][0]["protocolBinding"] == "HTTP+JSON"
+    assert card["supportedInterfaces"][0]["url"].endswith("/")
     assert client.post("/message:send", headers={"Authorization": "Bearer test-token", "Content-Type": "application/json"}, json={}).status_code == 415
     assert client.post("/message:send", headers={"Authorization": "Bearer test-token", "Content-Type": "application/a2a+json", "A2A-Version": "99.0"}, content=b"{}").status_code == 400
     assert client.get("/tasks", headers={"Authorization": "Bearer test-token"}).status_code == 200
@@ -112,11 +114,14 @@ try:
     body_a = {"message": {"messageId": "http-conflict-1", "contextId": "http-conflict", "role": "user", "parts": [{"text": "first payload"}]}}
     first_http = client.post("/message:send", headers=h, json=body_a)
     assert first_http.status_code == 200, first_http.text
+    assert "task" in first_http.json(), first_http.text
     body_b = {"message": {"messageId": "http-conflict-1", "contextId": "http-conflict", "role": "user", "parts": [{"text": "different payload"}]}}
     conflict_http = client.post("/message:send", headers=h, json=body_b)
     assert conflict_http.status_code == 200, conflict_http.text
-    conflict_data = conflict_http.json()["artifacts"][0]["parts"][0]["data"]
-    assert conflict_http.json()["status"]["state"] == "TASK_STATE_FAILED"
+    assert "task" in conflict_http.json(), conflict_http.text
+    conflict_task = conflict_http.json()["task"]
+    conflict_data = conflict_task["artifacts"][0]["parts"][0]["data"]
+    assert conflict_task["status"]["state"] == "TASK_STATE_FAILED"
     assert conflict_data["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
     assert conflict_data["side_effects"] == "none"
     invalid_continuation = client.post("/message:send", headers=h, json={"taskId": first["id"], "message": {"messageId": "http-invalid-cont", "contextId": first["contextId"], "parts": [{"text": "should not continue"}]}})
