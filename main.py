@@ -417,12 +417,14 @@ def find_evidence(docs: list[dict[str, str]], ai: dict[str, Any] | None, free_te
         ("risk or dispute signal", r"(?i)^.*(?:disput|void|cancel|bank\s+details?\s+changed|new\s+bank|fraud).*$"),
     ]
     for doc in docs:
-        lines = [norm(line) for line in doc["text"].splitlines() if norm(line)]
+        lines = [line.strip("\r\n") for line in doc["text"].splitlines() if line.strip()]
         for claim, pattern in patterns:
             for line in lines:
                 if re.search(pattern, line) and not any(x["doc_id"] == doc["id"] and x["quote"].lower() == line.lower() for x in evidence):
                     evidence.append({"doc_id": doc["id"], "document": doc["name"], "claim": claim, "quote": line[:500]})
                     break
+    for index, item in enumerate(evidence[:30], 1):
+        item.setdefault("evidence_id", f"{item.get('doc_id', 'D?')}-E{index}")
     return evidence[:30]
 
 
@@ -447,9 +449,9 @@ def extract_facts(docs: list[dict[str, str]], free_text: str) -> tuple[dict[str,
                 vendor = line
                 break
     if not invoice_number:
-        match = re.search(r"(?i)invoice[ _-]*(?:number|no\.?|#)\s*[:#\-]?\s*[\"']?([A-Z0-9][A-Z0-9\-/]{2,})", all_text)
+        match = re.search(r"(?i)invoice[ _-]*(?:number|no\.?|#|id)\s*[:#\-]?\s*[\"']?([A-Z0-9][A-Z0-9\-/]{1,})", all_text)
         if not match:
-            match = re.search(r"(?i)[\"'](?:invoice_number|invoice_no)[\"']\s*:\s*[\"']?([A-Z0-9][A-Z0-9\-/]{2,})", all_text)
+            match = re.search(r"(?i)[\"'](?:invoice_number|invoice_no|invoiceNumber|invoiceId|invoice_id)[\"']\s*:\s*[\"']?([A-Z0-9][A-Z0-9\-/]{1,})", all_text)
         invoice_number = match.group(1).strip(".,;:\"'") if match else ""
     if amount is None:
         amount = parse_labeled_amount(all_text, r"(?:invoice\s+total|total\s+due|amount\s+due|grand\s+total|balance\s+due|total\s+payable)")
@@ -543,6 +545,8 @@ def decide(facts: dict[str, Any], evidence: list[dict[str, str]]) -> dict[str, A
         "invoice": {k: facts.get(k) for k in ("vendor", "invoice_number", "amount", "currency", "invoice_date", "po_number")},
         "approval": {k: facts.get(k) for k in ("approval_present", "approver", "approved_amount", "approval_limit", "auto_approval_policy")},
         "evidence": evidence,
+        "evidence_ids": [item.get("evidence_id") for item in evidence if item.get("evidence_id")],
+        "decision_basis": [{"evidence_id": item.get("evidence_id"), "claim": item.get("claim"), "quote": item.get("quote")} for item in evidence if item.get("evidence_id")],
     }
 
 
@@ -878,13 +882,17 @@ def process_invoice(params: dict[str, Any], message: dict[str, Any]) -> dict[str
         status, receipt = execute_payment(decision, key)
         if status == "PAID" and receipt is not None:
             receipt = dict(receipt)
+            receipt_id = receipt.get("receipt_id") or receipt.get("id") or receipt.get("payment_id")
+            receipt["invoice_key"] = key
+            receipt["invoice_identity"] = {"vendor": decision["invoice"]["vendor"], "invoice_number": decision["invoice"]["invoice_number"]}
             receipt["invoice_binding"] = {
                 "invoice_key": key,
                 "vendor": decision["invoice"]["vendor"],
                 "invoice_number": decision["invoice"]["invoice_number"],
                 "amount": decision["invoice"]["amount"],
                 "currency": decision["invoice"]["currency"],
-                "binding_sha256": canonical_hash({"invoice_key": key, "amount": decision["invoice"]["amount"], "currency": decision["invoice"]["currency"], "receipt_id": receipt.get("receipt_id") or receipt.get("id") or receipt.get("payment_id")}),
+                "receipt_id": receipt_id,
+                "binding_sha256": canonical_hash({"invoice_key": key, "vendor": decision["invoice"]["vendor"], "invoice_number": decision["invoice"]["invoice_number"], "amount": decision["invoice"]["amount"], "currency": decision["invoice"]["currency"], "receipt_id": receipt_id}),
             }
         payment = {"status": status.lower(), "receipt": receipt}
         with transaction() as conn:
@@ -901,6 +909,7 @@ def process_invoice(params: dict[str, Any], message: dict[str, Any]) -> dict[str
             write_audit("receipt", task_id, key, "PAYMENT_RECEIPT_STORED", receipt)
 
     result = {**decision, "payment": payment, "task_id": task_id, "context_id": context_id, "created_at": utc_now()}
+    result.setdefault("evidence_ids", [item.get("evidence_id") for item in result.get("evidence", []) if item.get("evidence_id")])
     response_text = json.dumps(result, ensure_ascii=False, indent=2)
     state = state_for_action(decision["action"])
     task = make_task(task_id, context_id, response_text, result, state, task_history)
@@ -960,10 +969,13 @@ def public_origin(request: Request) -> str:
 @app.get("/.well-known/agent-card.json")
 def agent_card_v1(request: Request):
     base = public_origin(request)
-    input_modes = ["application/a2a+json", "application/json", "text/plain", "application/pdf", "text/csv"]
+    input_modes = ["application/a2a+json", "application/json", "text/plain", "application/pdf", "text/csv", "image/png", "image/jpeg"]
     output_modes = ["application/a2a+json", "application/json", "text/plain"]
     return {
         "name": "A2A Invoice Agent",
+        "url": base + "/",
+        "preferredTransport": "JSONRPC",
+        "protocolVersion": "1.0",
         "description": "An evidence-grounded A2A accounts-payable agent. It reads invoice packages, cites source documents, enforces approval authority and limits, prevents duplicate payments, persists task state, and binds receipts to the exact invoice identity.",
         "version": APP_VERSION,
         "supportedInterfaces": [
@@ -976,231 +988,13 @@ def agent_card_v1(request: Request):
         "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "API token"}},
         "security": [{"bearerAuth": []}],
         "skills": [{
-            "id": "invoice_decide_and_act",
-            "name": "Invoice decision, approval and safe payment",
-            "description": "Extracts vendor, invoice identity and totals from invoice packages; validates cited approvals and approval limits; rejects void invoices; holds disputes and bank changes; requests missing approval; pays only authorized invoices; detects duplicates by vendor plus invoice number; persists task lifecycle, idempotency and receipt audit records.",
-            "tags": ["invoice", "accounts-payable", "invoice-processing", "approval-limits", "duplicate-detection", "idempotency", "payment-receipts", "audit-trail", "task-lifecycle"],
-            "examples": ["Review this invoice package and pay only when the evidence proves the required approval.", "Check whether this vendor and invoice number has already been paid, and return its stored receipt if so."],
+            "id": "invoice-processing",
+            "name": "Invoice processing and safe payment",
+            "description": "Reads invoice, purchase-order, email and approval documents; chooses an evidence-supported action; enforces approval limits; prevents duplicate settlement; and persists receipts and task state.",
+            "tags": ["invoice", "accounts-payable", "approval", "payment", "duplicate-detection", "receipts"],
+            "examples": ["Review an invoice package and explain whether it can be paid."],
             "inputModes": input_modes,
             "outputModes": output_modes,
-        }],
-    }
-
-
-@app.get("/.well-known/agent.json")
-def agent_card_legacy(request: Request):
-    base = public_origin(request)
-    return {"name": "A2A Invoice Agent", "description": "Evidence-grounded, idempotent invoice decision and payment service.", "url": base + "/", "preferredTransport": "JSONRPC", "protocolVersion": "1.0", "capabilities": {"streaming": False, "pushNotifications": False}, "defaultInputModes": ["application/a2a+json", "application/json", "text/plain", "application/pdf"], "defaultOutputModes": ["application/a2a+json", "application/json", "text/plain"], "skills": [{"id": "invoice_decide_and_act", "name": "Invoice decision and safe payment", "description": "Cited invoice decisions, approval gates, duplicate protection and payment receipts.", "tags": ["invoice", "approval", "payment", "receipts"]}]}
-
-
-def task_error(code: int, message: str) -> JSONResponse:
-    return JSONResponse(status_code=code, content={"error": {"code": code, "status": "ERROR", "message": message}}, media_type="application/a2a+json")
-
-
-async def dispatch_jsonrpc(payload: dict[str, Any]) -> dict[str, Any]:
-    request_id = payload.get("id")
-    method = payload.get("method", "")
-    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
-    if method in {"message/send", "tasks/send", "SendMessage", "message:send"}:
-        message = params.get("message") if isinstance(params.get("message"), dict) else params
-        task = process_invoice(params, message if isinstance(message, dict) else {})
-        return {"jsonrpc": "2.0", "id": request_id, "result": to_legacy_task(task) if method == "tasks/send" else task}
-    if method in {"tasks/get", "GetTask"}:
-        task_id = norm(params.get("id") or params.get("taskId"))
-        task = get_task(task_id)
-        if task:
-            return {"jsonrpc": "2.0", "id": request_id, "result": to_legacy_task(task) if method == "GetTask" else task}
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": "Task not found"}}
-    if method in {"tasks/list", "ListTasks"}:
-        limit = max(1, min(int(params.get("pageSize") or params.get("limit") or 50), 100))
-        offset = max(0, int(params.get("offset") or 0))
-        with db_conn() as conn:
-            rows = conn.execute("SELECT response_json FROM tasks ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
-            count = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
-        tasks = [json.loads(r["response_json"]) for r in rows if r["response_json"] and r["response_json"] != "{}"]
-        if method == "ListTasks":
-            tasks = [to_legacy_task(x) for x in tasks]
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"tasks": tasks, "nextPageToken": str(offset + len(tasks)) if offset + len(tasks) < count else "", "pageSize": limit, "totalSize": count}}
-    if method in {"tasks/cancel", "CancelTask"}:
-        task_id = norm(params.get("id") or params.get("taskId"))
-        canceled = cancel_task(task_id)
-        if isinstance(canceled, JSONResponse):
-            try:
-                detail = json.loads(canceled.body.decode())
-            except Exception:
-                detail = {"message": "Task cannot be canceled"}
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32010, "message": detail.get("error", {}).get("message", "Task cannot be canceled")}}
-        return {"jsonrpc": "2.0", "id": request_id, "result": to_legacy_task(canceled) if method == "CancelTask" else canceled}
-    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
-
-
-def cancel_task(task_id: str):
-    with transaction() as conn:
-        if DATABASE_URL.startswith(("postgres://", "postgresql://")):
-            conn.execute("LOCK TABLE invoices IN EXCLUSIVE MODE")
-        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-        if not row:
-            return task_error(404, "Task not found")
-        task = json.loads(row["response_json"]) if row["response_json"] and row["response_json"] != "{}" else None
-        if row["state"] in {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED"}:
-            return task_error(409, "A terminal task cannot be canceled")
-        key = row["invoice_key"]
-        if key:
-            inv = conn.execute("SELECT status FROM invoices WHERE invoice_key=?", (key,)).fetchone()
-            if inv and inv["status"] in {"PROCESSING", "PAID", "PAYMENT_UNCERTAIN"}:
-                return task_error(409, "Cancellation is blocked because payment is processing, settled, or requires reconciliation; the receipt must remain bound to the task.")
-        stamp = utc_now()
-        if task is None:
-            task = {"id": task_id, "contextId": row["context_id"], "history": [], "artifacts": []}
-        task["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": stamp}
-        conn.execute("UPDATE tasks SET state=?,response_json=?,updated_at=? WHERE task_id=?",
-                     ("TASK_STATE_CANCELED", json.dumps(task), stamp, task_id))
-    write_audit("action", task_id, key, "TASK_CANCELED", {})
-    return task
-
-
-@app.post("/")
-@app.post("/a2a/")
-@app.post("/a2a")
-@app.post("/a2a/json")
-async def a2a_endpoint(request: Request):
-    if not has_bearer(request):
-        return bearer_error()
-    err = version_error(request)
-    if err:
-        return err
-    err = require_a2a_media(request)
-    if err:
-        return err
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}, media_type="application/a2a+json")
-    if isinstance(payload, dict) and isinstance(payload.get("params"), dict) and request.headers.get("idempotency-key"):
-        payload["params"]["_idempotency_key"] = request.headers["idempotency-key"]
-    if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
-        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "id": payload.get("id") if isinstance(payload, dict) else None, "error": {"code": -32600, "message": "Invalid JSON-RPC request"}}, media_type="application/a2a+json")
-    try:
-        result = await dispatch_jsonrpc(payload)
-        return JSONResponse(content=result, headers={"Cache-Control": "no-store"}, media_type="application/a2a+json")
-    except AgentError as exc:
-        return JSONResponse(status_code=exc.http_status, content={"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32000, "message": str(exc), "data": exc.code}}, media_type="application/a2a+json")
-    except Exception as exc:
-        return JSONResponse(status_code=500, content={"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32603, "message": "Internal error", "data": type(exc).__name__}}, media_type="application/a2a+json")
-
-
-@app.post("/message:send")
-async def http_json_send(request: Request):
-    if not has_bearer(request):
-        return bearer_error()
-    err = version_error(request)
-    if err:
-        return err
-    err = require_a2a_media(request)
-    if err:
-        return err
-    try:
-        params = await request.json()
-        if isinstance(params, dict) and request.headers.get("idempotency-key"):
-            params["_idempotency_key"] = request.headers["idempotency-key"]
-        message = params.get("message") if isinstance(params, dict) and isinstance(params.get("message"), dict) else params
-        task = process_invoice(params if isinstance(params, dict) else {}, message if isinstance(message, dict) else {})
-        return JSONResponse(content=task, media_type="application/a2a+json", headers={"Cache-Control": "no-store"})
-    except AgentError as exc:
-        # HTTP+JSON message:send is an A2A task operation. Once transport,
-        # authentication, version and media type have been validated, domain
-        # conflicts are reported as a failed task with HTTP 200. This keeps
-        # the transport successful while making the rejected action explicit
-        # in the task result; importantly, no conflicting request is executed.
-        params_obj = params if isinstance(params, dict) else {}
-        msg_obj = message if isinstance(message, dict) else {}
-        task_id = norm(params_obj.get("taskId") or params_obj.get("task_id")) or str(uuid.uuid4())
-        context_id = norm(msg_obj.get("contextId") or params_obj.get("contextId") or params_obj.get("context_id")) or str(uuid.uuid4())
-        error_result = {
-            "action": "REJECTED",
-            "reason": str(exc),
-            "error": {"code": exc.code, "http_status": exc.http_status},
-            "payment": None,
-            "task_id": task_id,
-            "context_id": context_id,
-            "side_effects": "none",
-        }
-        rejected = make_task(
-            task_id, context_id, json.dumps(error_result, ensure_ascii=False),
-            error_result, "TASK_STATE_FAILED", [msg_obj] if msg_obj else []
-        )
-        return JSONResponse(content=rejected, status_code=200, media_type="application/a2a+json", headers={"Cache-Control": "no-store"})
-    except Exception as exc:
-        return JSONResponse(status_code=500, content={"error": {"code": 500, "message": "Internal error", "details": [{"reason": "INTERNAL", "message": type(exc).__name__}]}}, media_type="application/a2a+json")
-
-
-@app.get("/tasks")
-def list_tasks(request: Request, limit: int = 50, offset: int = 0):
-    if not has_bearer(request):
-        return bearer_error()
-    limit = max(1, min(limit, 100))
-    offset = max(0, offset)
-    with db_conn() as conn:
-        rows = conn.execute("SELECT response_json FROM tasks WHERE response_json<>'{}' ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
-        total = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
-    tasks = [json.loads(row["response_json"]) for row in rows]
-    return JSONResponse(content={"tasks": tasks, "totalSize": total, "pageSize": limit, "nextPageToken": str(offset + len(tasks)) if offset + len(tasks) < total else ""}, media_type="application/a2a+json")
-
-
-@app.get("/tasks/{task_id}")
-def get_task_http(task_id: str, request: Request):
-    if not has_bearer(request):
-        return bearer_error()
-    task = get_task(task_id)
-    if not task:
-        return task_error(404, "Task not found")
-    return JSONResponse(content=task, media_type="application/a2a+json")
-
-
-@app.get("/audit/actions")
-def audit_actions(request: Request, limit: int = 100):
-    if not has_bearer(request):
-        return bearer_error()
-    limit = max(1, min(limit, 500))
-    with db_conn() as conn:
-        rows = conn.execute("SELECT event_id,task_id,invoice_key,action,payload_json,created_at FROM audit_events WHERE event_type='action' ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    return {"events": [{"event_id": r["event_id"], "task_id": r["task_id"], "invoice_key": r["invoice_key"], "action": r["action"], "payload": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "retention_cap": int(os.getenv("AUDIT_ACTION_CAP", "500"))}
-
-
-@app.get("/audit/receipts")
-def audit_receipts(request: Request, limit: int = 100):
-    if not has_bearer(request):
-        return bearer_error()
-    limit = max(1, min(limit, 500))
-    with db_conn() as conn:
-        rows = conn.execute("SELECT event_id,task_id,invoice_key,action,receipt_id,payload_json,created_at FROM audit_events WHERE event_type='receipt' ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    return {"receipts": [{"event_id": r["event_id"], "task_id": r["task_id"], "invoice_key": r["invoice_key"], "action": r["action"], "receipt_id": r["receipt_id"], "receipt": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "retention_cap": int(os.getenv("AUDIT_RECEIPT_CAP", "200"))}
-
-
-@app.get("/audit")
-def audit_summary(request: Request, limit: int = 100):
-    if not has_bearer(request):
-        return bearer_error()
-    limit = max(1, min(limit, 200))
-    with db_conn() as conn:
-        rows = conn.execute("SELECT event_type,event_id,task_id,invoice_key,action,receipt_id,payload_json,created_at FROM audit_events ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-    return {"events": [{"type": r["event_type"], "event_id": r["event_id"], "task_id": r["task_id"], "invoice_key": r["invoice_key"], "action": r["action"], "receipt_id": r["receipt_id"], "payload": json.loads(r["payload_json"]), "created_at": r["created_at"]} for r in rows], "action_cap": int(os.getenv("AUDIT_ACTION_CAP", "500")), "receipt_cap": int(os.getenv("AUDIT_RECEIPT_CAP", "200"))}
-
-
-@app.get("/isolation-probe")
-@app.get("/admin/isolation-probe")
-def isolation_probe():
-    backend = "postgresql" if DATABASE_URL.startswith(("postgres://", "postgresql://")) else "sqlite"
-    return {"available": True, "backend": backend, "transactional": True, "atomic_invoice_reservation": True,
-            "unique_invoice_identity": True, "invoice_identity_fields": ["normalized_vendor", "normalized_invoice_number"],
-            "amount_part_of_duplicate_identity": False, "postgres_lock": "LOCK TABLE invoices IN EXCLUSIVE MODE" if backend == "postgresql" else None,
-            "sqlite_lock": "BEGIN IMMEDIATE" if backend == "sqlite" else None}
-
-
-@app.get("/ledger")
-def ledger_summary(request: Request):
-    if not has_bearer(request):
-        return bearer_error()
-    with db_conn() as conn:
-        rows = conn.execute("SELECT status,COUNT(*) AS n FROM invoices GROUP BY status").fetchall()
-    return {row["status"].lower(): row["n"] for row in rows}
+        }, {
+            "id": "invoice_decide_and_act",
+            "name": "Invoice decision, approval and safe payment",
