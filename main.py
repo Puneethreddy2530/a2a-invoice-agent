@@ -541,6 +541,8 @@ def decide(facts: dict[str, Any], evidence: list[dict[str, str]]) -> dict[str, A
         action, reason = "REQUEST_APPROVAL", "No sufficient invoice-specific approval and applicable approval limit were both evidenced."
     return {
         "action": action,
+        "business_action": action,
+        "decision": action,
         "reason": reason,
         "invoice": {k: facts.get(k) for k in ("vendor", "invoice_number", "amount", "currency", "invoice_date", "po_number")},
         "approval": {k: facts.get(k) for k in ("approval_present", "approver", "approved_amount", "approval_limit", "auto_approval_policy")},
@@ -801,7 +803,15 @@ def process_invoice(params: dict[str, Any], message: dict[str, Any]) -> dict[str
         context_id = requested_context or str(uuid.uuid4())
         request_json = {"messages": [message], "params": {k: v for k, v in params.items() if k != "message"}}
         combined_message = message
-        create_working_task(task_id, context_id, message_id, request_json, fingerprint)
+        try:
+            create_working_task(task_id, context_id, message_id, request_json, fingerprint)
+        except Exception:
+            # A concurrent retry may win the unique messageId insert between
+            # the initial replay lookup and task creation. Re-read durable state.
+            replay = get_message_replay(message_id, fingerprint)
+            if replay:
+                return replay
+            raise AgentError("This messageId is already being processed; retry the same payload.", "REQUEST_IN_PROGRESS", 409)
 
     task_history.append(message)
     effective_params = dict(request_json.get("params", {}))
@@ -835,6 +845,10 @@ def process_invoice(params: dict[str, Any], message: dict[str, Any]) -> dict[str
     decision = decide(facts, evidence)
     decision["ai_understanding"] = {"provider": "OpenAI-compatible API" if ai_used else "not_configured_or_unavailable", "model": LLM_MODEL if ai_used else None}
     key = invoice_key(facts["vendor"], facts["invoice_number"]) if facts["vendor"] and facts["invoice_number"] else None
+    if key:
+        decision["invoice_key"] = key
+        decision["invoice_identity"] = {"vendor": facts["vendor"], "invoice_number": facts["invoice_number"]}
+        decision["deduplication"] = {"key": key, "fields": ["vendor", "invoice_number"], "amount_is_part_of_identity": False}
     payment: dict[str, Any] | None = None
     reserved_for_payment = False
 
@@ -1228,4 +1242,27 @@ def ledger_summary(request: Request):
 def cancel_task_http(task_id: str, request: Request):
     if not has_bearer(request):
         return bearer_error()
+    err = version_error(request)
+    if err:
+        return err
+    media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if media and media not in {"application/a2a+json", "application/json"}:
+        return JSONResponse(status_code=415, content={"error": {"code": 415, "message": "Unsupported cancellation media type."}}, media_type="application/a2a+json")
+    return cancel_task(task_id)
+
+
+@app.post("/tasks/cancel")
+async def cancel_task_body(request: Request):
+    if not has_bearer(request):
+        return bearer_error()
+    err = version_error(request)
+    if err:
+        return err
+    try:
+        payload = await request.json()
+    except Exception:
+        return task_error(400, "A task id is required for cancellation.")
+    task_id = norm(payload.get("id") or payload.get("taskId") or payload.get("task_id")) if isinstance(payload, dict) else ""
+    if not task_id:
+        return task_error(400, "A task id is required for cancellation.")
     return cancel_task(task_id)
