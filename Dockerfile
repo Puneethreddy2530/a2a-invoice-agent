@@ -6,6 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY incident_service.py .
 COPY incident_planner.py .
+COPY mailroom_agent ./mailroom_agent
 RUN mkdir -p /app/data
 EXPOSE 8000
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
