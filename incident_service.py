@@ -332,7 +332,7 @@ def _attrs(d:dict):
     for k,v in d.items():
         if v is None:continue
         if isinstance(v,bool):val={"boolValue":v}
-        elif isinstance(v,int):val={"intValue":str(v)}
+        elif isinstance(v,int):val={"intValue":v}
         elif isinstance(v,float):val={"doubleValue":v}
         else:val={"stringValue":str(v)}
         out.append({"key":k,"value":val})
@@ -405,7 +405,18 @@ def _make_dispatch(s,tool,args,phase,evidence=None,attempt=1,action_id=None,call
         if approval_id:attrs["ga5.approval.id"]=approval_id
         if approval_nonce:attrs["ga5.approval.nonce"]=approval_nonce
         exec_id=_span(s,f"execute_tool {tool}",1,s["agentSpanId"],attrs,1)
-    client_attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"ga5.attempt":attempt,"http.request.method":"POST","http.request.resend_count":max(0,attempt-1)}
+    client_attrs={
+        "ga5.run.id":s["runId"],
+        "ga5.public.marker":s["publicMarker"],
+        "ga5.action.id":action_id,
+        "ga5.call.id":call_id,
+        "ga5.phase":phase,
+        "gen_ai.tool.name":tool,
+        "gen_ai.tool.call.id":call_id,
+        "ga5.attempt":attempt,
+        "http.request.method":"POST",
+        "http.request.resend_count":max(0,attempt-1),
+    }
     if approval_id:client_attrs["ga5.approval.id"]=approval_id
     if approval_nonce:client_attrs["ga5.approval.nonce"]=approval_nonce
     client_id=_span(s,f"POST tool/{tool}",3,exec_id,client_attrs,1)
@@ -564,11 +575,18 @@ async def post_receipts(run_id:str,request:Request):
                 if oc.get("errorType")=="timeout" or status==0: attrs["error.type"]="timeout";span_status=2
                 elif status is not None and not 200<=status<300:attrs["http.response.status_code"]=status;attrs["error.type"]=str(status);span_status=2
                 if status is not None:attrs["http.response.status_code"]=status
-                correlated_attrs={"ga5.receipt.id":rid,"ga5.receipt.nonce":nonce}
+                correlated_attrs={
+                    "ga5.receipt.id":rid,
+                    "ga5.receipt.nonce":nonce,
+                }
                 if status is not None:
                     correlated_attrs["http.response.status_code"]=status
-                if err_type:
-                    correlated_attrs["error.type"]=err_type
+                if status==0 or str(err_type or "").lower()=="timeout":
+                    correlated_attrs["error.type"]="timeout"
+                elif status is not None and not 200<=status<300:
+                    correlated_attrs["error.type"]=str(err_type or status)
+                if oc.get("resultClass") is not None:
+                    correlated_attrs["gen_ai.response.result_class"]=oc.get("resultClass")
                 # Receipt IDs/nonces belong on the exact HTTP client attempt
                 # identified by the dispatch traceparent. The logical
                 # execute_tool span is marked failed only if the final attempt
@@ -577,7 +595,12 @@ async def post_receipts(run_id:str,request:Request):
                     if sp["spanId"]==d["clientSpanId"]:
                         existing={x["key"]:x["value"] for x in sp["attributes"]}
                         for k,v in correlated_attrs.items():
-                            existing[k]={"stringValue":str(v)} if isinstance(v,str) else {"intValue":str(v)}
+                            if isinstance(v,bool):
+                                existing[k]={"boolValue":v}
+                            elif isinstance(v,int):
+                                existing[k]={"intValue":v}
+                            else:
+                                existing[k]={"stringValue":str(v)}
                         sp["attributes"]=[{"key":k,"value":v} for k,v in existing.items()]
                         sp["status"]={"code":span_status}
                 logical_failure=span_status==2 and not (status==503 and attempt==1)
