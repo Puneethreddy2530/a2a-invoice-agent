@@ -207,3 +207,101 @@ for action in action_rows:
 print("PASS: case aliases, decoys, known-good release, exact flag, policy gates, trace nesting and action/receipt correlation")
 
 # Regression suite version 2: case-aware planning and telemetry integrity.
+
+
+# Full GA5 correlation assertions: dispatch traceparent -> client span ->
+# execute_tool span -> receiptLog, plus approval gate -> approved effect.
+import re
+def attrs(span):
+    return {a["key"]: next(iter(a["value"].values())) for a in span.get("attributes", [])}
+def verify_correlation(payload):
+    spans=payload["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    by_id={s["spanId"]:s for s in spans}
+    trace_ids={s["traceId"] for s in spans}
+    assert len(trace_ids)==1, trace_ids
+    for action in payload["actionLog"]:
+        m=re.fullmatch(r"00-([0-9a-f]{32})-([0-9a-f]{16})-01",action["traceparent"])
+        assert m, action["traceparent"]
+        trace_id,client_id=m.groups()
+        assert trace_id in trace_ids and client_id in by_id, action
+        client=by_id[client_id]
+        ca=attrs(client)
+        assert client["kind"]==3 and client["name"]==f"POST tool/{action['toolName']}"
+        assert ca.get("ga5.action.id")==action["actionId"], (ca,action)
+        assert int(ca.get("ga5.attempt"))==action["attempt"], (ca,action)
+        assert client["parentSpanId"] in by_id, client
+        execute=by_id[client["parentSpanId"]]
+        ea=attrs(execute)
+        assert execute["kind"]==1 and execute["name"]==f"execute_tool {action['toolName']}"
+        assert ea.get("ga5.action.id")==action["actionId"], (ea,action)
+        assert ea.get("gen_ai.tool.call.id")==action["callId"], (ea,action)
+        assert ea.get("gen_ai.tool.name")==action["toolName"], (ea,action)
+        assert execute["parentSpanId"] in by_id
+        receipts=[x for x in payload["receiptLog"] if x.get("actionId")==action["actionId"] and x.get("callId")==action["callId"] and x.get("attempt")==action["attempt"]]
+        assert receipts, (action,payload["receiptLog"])
+        assert ca.get("ga5.receipt.id") in {x.get("receiptId") for x in receipts}, (ca,receipts)
+        assert ca.get("ga5.receipt.nonce") in {x.get("nonce") for x in receipts}, (ca,receipts)
+    for parent in spans:
+        for child in spans:
+            if child.get("parentSpanId")==parent["spanId"]:
+                assert int(parent["startTimeUnixNano"])<=int(child["startTimeUnixNano"])
+                assert int(parent["endTimeUnixNano"])>=int(child["endTimeUnixNano"])
+
+# Terminal approval flow, so approval receipt, gate span and effect dispatch
+# can all be correlated using their real identifiers.
+approved_effect=z["dispatches"][0]
+zdone=c.post('/v2/incidents/test-deploy/receipts',json={
+    'receiptId':'d-rec3',
+    'outcomes':[{'actionId':approved_effect['actionId'],'callId':approved_effect['callId'],
+                 'attempt':approved_effect['attempt'],'status':200,'resultClass':'ok','nonce':'effect-approved-nonce'}]
+})
+assert zdone.status_code==200 and zdone.json()['status']=='completed', zdone.text
+approved_terminal=zdone.json()
+verify_correlation(approved_terminal)
+approval_receipt=next(x for x in approved_terminal['receiptLog'] if x.get('approvalId')==a['approvalId'])
+assert approval_receipt['decision']=='approved' and approval_receipt['nonce']=='approved-nonce'
+approval_gate=[s for s in approved_terminal['otlp']['resourceSpans'][0]['scopeSpans'][0]['spans'] if s['name']=='approval_gate']
+assert any(attrs(s).get('ga5.approval.id')==a['approvalId'] and
+           attrs(s).get('ga5.approval.nonce')=='approved-nonce' and
+           attrs(s).get('ga5.receipt.id')=='d-rec2' and
+           attrs(s).get('ga5.receipt.nonce')=='approved-nonce'
+           for s in approval_gate)
+effect_action=next(x for x in approved_terminal['actionLog'] if x['phase']=='effect')
+assert effect_action['approvalId']==a['approvalId']
+assert effect_action['approvalNonce']=='approved-nonce'
+verify_correlation(fin.json())
+
+# W3C incoming context must be preserved on the root server span; without an
+# incoming parent, parentSpanId is omitted (never serialized as null).
+trace_id='1'*32; incoming_parent='2'*16
+trace_body={**body,'runId':'test-trace-context'}
+trace_response=c.post('/v2/incidents',json=trace_body,headers={
+    'traceparent':f'00-{trace_id}-{incoming_parent}-01',
+    'tracestate':'vendor=correlation-test'
+})
+assert trace_response.status_code==200
+first=trace_response.json()
+# Terminalize the diagnostics/effect in a deterministic sequence.
+for ix in range(8):
+    pending=first.get('dispatches',[])
+    if pending:
+        outs=[{'actionId':d['actionId'],'callId':d['callId'],'attempt':d['attempt'],
+               'status':200,'nonce':f'trace-{ix}-{j}'} for j,d in enumerate(pending)]
+        first=c.post('/v2/incidents/test-trace-context/receipts',json={
+            'receiptId':f'trace-rec-{ix}','outcomes':outs
+        }).json()
+    elif first.get('approvals'):
+        aps=[{'approvalId':a0['approvalId'],'decision':'approved','nonce':f'trace-approval-{ix}'} for a0 in first['approvals']]
+        first=c.post('/v2/incidents/test-trace-context/receipts',json={
+            'receiptId':f'trace-approval-rec-{ix}','approvals':aps
+        }).json()
+    else:
+        break
+if first.get('status')!='completed':
+    first=c.get('/v2/incidents/test-trace-context').json()
+assert first['status']=='completed'
+trace_spans=first['otlp']['resourceSpans'][0]['scopeSpans'][0]['spans']
+root=next(s for s in trace_spans if s['name']=='POST /v2/incidents')
+assert root['traceId']==trace_id and root['parentSpanId']==incoming_parent
+assert c.get('/v2/incidents/test-run-1').headers['traceparent'].startswith('00-')
+print("PASS: W3C traceparent, dispatch/client/execute span IDs, attempt, approval and receipt correlation")
