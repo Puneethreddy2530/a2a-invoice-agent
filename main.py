@@ -1159,3 +1159,7 @@ def audit_summary(request: Request, authorization: str | None = Header(default=N
 # Local import convenience and test initialization. Render starts through uvicorn and triggers startup too.
 if os.getenv("INIT_DB_ON_IMPORT", "0") == "1":
     init_db()
+
+# IITM TDS GA3: observable incident triage service
+from incident_service import router as incident_router
+app.include_router(incident_router)
