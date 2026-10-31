@@ -228,6 +228,13 @@ def verify_correlation(payload):
         ca=attrs(client)
         assert client["kind"]==3 and client["name"]==f"POST tool/{action['toolName']}"
         assert ca.get("ga5.action.id")==action["actionId"], (ca,action)
+        assert ca.get("gen_ai.tool.call.id")==action["callId"], (ca,action)
+        assert ca.get("ga5.call.id")==action["callId"], (ca,action)
+        assert ca.get("gen_ai.tool.name")==action["toolName"], (ca,action)
+        raw_client_attrs={a["key"]:a["value"] for a in client.get("attributes",[])}
+        assert isinstance(raw_client_attrs["ga5.attempt"]["intValue"], int), raw_client_attrs
+        assert isinstance(raw_client_attrs["http.request.resend_count"]["intValue"], int), raw_client_attrs
+        assert raw_client_attrs["http.request.resend_count"]["intValue"]==action["attempt"]-1
         assert int(ca.get("ga5.attempt"))==action["attempt"], (ca,action)
         assert client["parentSpanId"] in by_id, client
         execute=by_id[client["parentSpanId"]]
