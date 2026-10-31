@@ -224,3 +224,5 @@ def test_health_and_exact_endpoint_are_live_in_app():
     assert r.status_code == 200
     assert r.json()["profile"] == PROFILE
     assert r.json()["status"] == "ok"
+
+# Test suite v1: signed receipt, replay, binding, schema and endpoint health.
