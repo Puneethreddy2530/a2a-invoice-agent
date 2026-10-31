@@ -13,7 +13,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import tempfile
-DB_PATH = os.environ.get("GA3_MAILROOM_DB") or os.path.join("/app", "data", "t3ga3_mailroom_agent.db")
+DB_PATH = os.environ.get("GA3_MAILROOM_DB") or os.path.join(tempfile.gettempdir(), "t3ga3_mailroom_agent.db")
 
 
 def get_db() -> sqlite3.Connection:
