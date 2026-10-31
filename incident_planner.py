@@ -264,25 +264,30 @@ def _parse_pod(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 def _parse_replicas(text: str, default: int = 2) -> int:
-    patterns = (
+    # An explicitly stated proposed/recovery target takes precedence.
+    for pat in (
         r"(?:proposed\s+target|target|recovery target|desired)\s*(?:is|of|:|=)?\s*(?:exactly\s*)?(\d{1,3})\s*(?:application\s+)?(?:replicas|pods)?",
         r"(\d{1,3})\s+(?:application\s+)?replicas?\b",
-        r"replicas?\s*[=:]\s*(\d+)",
-    )
-    for pat in patterns:
+    ):
         m = re.search(pat, text or "", re.I)
         if m:
-            try:
-                n = int(m.group(1))
-                if 0 < n <= 200:
-                    return n
-            except ValueError:
-                pass
-    # If current replicas are below a stated maximum, the minimal safe scale
-    # proposal is one additional replica, not an arbitrary jump.
+            n = int(m.group(1))
+            if 0 < n <= 200:
+                return n
+    # If operating below a hard maximum, propose the smallest safe increment.
     m = re.search(r"(?:current|operating)\s+replicas\s*[=:]\s*(\d+)[^\n]*?(?:maximum|ceiling|contract maximum)\s*[=:]\s*(\d+)", text or "", re.I)
-    if m and int(m.group(1)) < int(m.group(2)):
-        return int(m.group(1)) + 1
+    if not m:
+        m = re.search(r"replicas[^=\n]{0,20}=\s*(\d+)[^\n]*?(?:maximum|ceiling)\s*=\s*(\d+)", text or "", re.I)
+    if m:
+        current, maximum = int(m.group(1)), int(m.group(2))
+        if current < maximum:
+            return current + 1
+        return current
+    m = re.search(r"replicas?\s*[=:]\s*(\d+)", text or "", re.I)
+    if m:
+        n = int(m.group(1))
+        if 0 < n <= 200:
+            return n
     return default
 
 def _at_scaling_limit(text: str) -> bool:
@@ -331,8 +336,8 @@ def extract_entities(incident: Dict[str, Any]) -> Dict[str, Any]:
     # explicit structured fields authoritative.
     return {
         "service": service,
-        "release": incident.get("release") or _parse_release(transcript) or "previous",
-        "flag": incident.get("flagName") or _parse_flag(transcript) or "feature_flag",
+        "release": incident.get("release") or _parse_release(transcript),
+        "flag": incident.get("flagName") or _parse_flag(transcript),
         "dep": incident.get("dependency") or _parse_dependency(transcript) or f"{service}-upstream",
         "pod": incident.get("pod") or _parse_pod(transcript) or f"{service}-0",
         "replicas": incident.get("targetReplicas") or _parse_replicas(transcript),
@@ -403,9 +408,9 @@ def _value_for_key(key: str, prop: Dict[str, Any], ctx: Dict[str, Any]) -> Any:
     elif "metric" in kl:
         value = ctx["metric"]
     elif "release" in kl or "version" in kl:
-        value = ctx["release"]
+        value = ctx["release"] or "previous"
     elif "flag" in kl:
-        value = ctx["flag"]
+        value = ctx["flag"] or "feature_flag"
     elif "pod" in kl:
         value = ctx["pod"]
     elif "replica" in kl or kl in ("count", "desired", "size", "instances"):
