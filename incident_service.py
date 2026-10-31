@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
+from incident_planner import analyze_incident, get_effect_arguments
 
 PROFILE = "ga5-incident-agent/v2"
 MAX_BODY_BYTES = 768 * 1024
@@ -89,13 +90,15 @@ def _forbidden(body: dict) -> list[str]:
             if isinstance(x,str) and len(x.strip())>=4: out.append(x.strip())
     marker=str(body.get("publicMarker") or "")
     rid=str(body.get("runId") or "")
-    return sorted({x for x in out if x and x not in marker and x not in rid}, key=lambda x:(-len(x),x))
+    # Exclude only an exact collision with an identifier. A secret that merely
+    # happens to be a substring of a public marker must still be redacted.
+    return sorted({x for x in out if x and x != marker and x != rid}, key=lambda x:(-len(x),x))
 
 def _scrub(obj: Any, forbidden: list[str]):
     if isinstance(obj,str):
         for x in forbidden: obj=obj.replace(x,"[REDACTED]")
         return obj
-    if isinstance(obj,dict): return {k:_scrub(v,forbidden) for k,v in obj.items()}
+    if isinstance(obj,dict): return {_scrub(k,forbidden) if isinstance(k,str) else k:_scrub(v,forbidden) for k,v in obj.items()}
     if isinstance(obj,list): return [_scrub(v,forbidden) for v in obj]
     return obj
 
@@ -311,12 +314,9 @@ def _choose_effect(cause:str, incident:dict, policy:dict, catalog:list):
 
 
 def _effect_args(tool:str, incident:dict, cause:str, catalog:list)->dict:
-    ent=_entities(incident,incident.get("transcript", "")); t=next((x for x in catalog if x.get("name")==tool),None)
-    ctx={"service":ent["service"],"metric":"error_rate","query":cause,"release":ent["release"],"flag":ent["flag"],"pod":ent["pod"],"replicas":ent["replicas"],"dep":ent["dep"],"cause":cause,"severity":incident.get("severity","SEV-1"),"reason":f"{cause.replace('_',' ')} on {ent['service']}","topic":"incident-recovery","config_key":"runtime","namespace":incident.get("namespace",ent["service"])}
-    if not t:return {"service":ent["service"],"reason":ctx["reason"]}
-    args=_tool_args(t,ctx,{})
-    if args:return args
-    return {"service":ent["service"]}
+    # The planner parses known-good rollback targets, exact flag names, pod IDs,
+    # current/maximum replicas and delegation budgets from the case evidence.
+    return get_effect_arguments(tool, incident, cause, catalog)
 
 # ---------- W3C trace + OTLP ----------
 TRACE_RE=re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
@@ -348,8 +348,18 @@ def _span(state:dict,name:str,kind:int,parent:str|None,attrs:dict,status:int=1,l
 def _otlp(state):
     spans=[dict(s) for s in state["spans"]]
     by={s["spanId"]:s for s in spans}
-    # Expand parents to enclose all child span intervals.
-    for child in spans:
+    # Expand parents from leaves toward the root so grandparents enclose the
+    # full interval of every descendant (a single chronological pass is not enough).
+    def depth(span):
+        n=0
+        cur=span
+        seen=set()
+        while cur.get("parentSpanId") in by and cur["parentSpanId"] not in seen and n<64:
+            seen.add(cur["parentSpanId"])
+            cur=by[cur["parentSpanId"]]
+            n+=1
+        return n
+    for child in sorted(spans,key=depth,reverse=True):
         p=by.get(child.get("parentSpanId"))
         if p:
             p["startTimeUnixNano"]=str(min(int(p["startTimeUnixNano"]),int(child["startTimeUnixNano"])))
@@ -388,10 +398,10 @@ def _make_dispatch(s,tool,args,phase,evidence=None,attempt=1,action_id=None,call
             if exec_id:
                 break
     if not exec_id:
-        attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"gen_ai.tool.name":tool,"gen_ai.tool.call.id":call_id,"gen_ai.operation.name":"execute_tool"}
+        attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"ga5.call.id":call_id,"ga5.phase":phase,"gen_ai.tool.name":tool,"gen_ai.tool.call.id":call_id,"gen_ai.operation.name":"execute_tool"}
         if approval_id:attrs["ga5.approval.id"]=approval_id
         exec_id=_span(s,f"execute_tool {tool}",1,s["agentSpanId"],attrs,1)
-    client_attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"ga5.attempt":attempt,"http.request.method":"POST","http.request.resend_count":max(0,attempt-1)}
+    client_attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"ga5.call.id":call_id,"ga5.phase":phase,"ga5.attempt":attempt,"gen_ai.tool.call.id":call_id,"http.request.method":"POST","http.request.resend_count":max(0,attempt-1)}
     if approval_id:client_attrs["ga5.approval.id"]=approval_id
     client_id=_span(s,f"POST tool/{tool}",3,exec_id,client_attrs,1)
     d={"actionId":action_id,"callId":call_id,"phase":phase,"toolName":tool,"arguments":args,"evidence":evidence or [],"attempt":attempt,"traceparent":_traceparent(s["traceId"],client_id),"clientSpanId":client_id,"approvalId":approval_id,"approvalNonce":approval_nonce,"tracestate":s.get("traceState")}
@@ -464,15 +474,13 @@ async def create_incident(request:Request):
         if old:
             if old["requestHash"]!=reqhash:raise HTTPException(409,"RUID_CONFLICT")
             return _for_response(old,old.get("lastResponse") or (_terminal(old) if old["status"] in ("completed","failed") else _waiting(old)))
-        cause=_cause(inc);evidence=_select_evidence(inc,cause);key=_cause_key(cause);ent=_entities(inc,inc.get("transcript", ""))
-        chosen=_choose_effect(cause,inc,policy,catalog)
+        cause,evidence,plans,chosen,requires_approval=analyze_incident(inc,catalog,policy)
         trace_id,parent=_trace_context(request.headers.get("traceparent"));tracestate=request.headers.get("tracestate") if parent else None
         state={"runId":run,"requestHash":reqhash,"profile":PROFILE,"status":"waiting","incident":inc,"toolCatalog":catalog,"policy":policy,"publicMarker":body.get("publicMarker") or "marker-telemetry-default","forbidden":_forbidden(body),"diagnosis":{"rootCause":cause,"evidence":evidence},"chosenEffect":chosen,"suppressed":[],"dispatches":[],"receipts":[],"approvals":[],"receiptResponses":{},"traceId":trace_id,"traceState":tracestate,"serverSpanId":None,"agentSpanId":None,"spans":[]}
         rootattrs={"ga5.run.id":run,"ga5.public.marker":state["publicMarker"],"http.request.method":"POST","http.route":"/v2/incidents","http.response.status_code":200}
         state["serverSpanId"]=_span(state,"POST /v2/incidents",2,parent,rootattrs,1)
         state["agentSpanId"]=_span(state,"invoke_agent incident-response",1,state["serverSpanId"],{"ga5.run.id":run,"ga5.public.marker":state["publicMarker"]},1)
         _span(state,"chat incident-plan",3,state["agentSpanId"],{"ga5.run.id":run,"ga5.public.marker":state["publicMarker"],"gen_ai.operation.name":"chat","gen_ai.request.model":os.getenv("INCIDENT_MODEL","deterministic-rule-planner/1.0")},1)
-        plans=_diag_plan(cause,inc,policy,catalog,evidence)
         ds=[]
         exec_span_ids=[]
         for p in plans:
@@ -515,9 +523,9 @@ async def post_receipts(run_id:str,request:Request):
                 a=pending[ap["approvalId"]]
                 if decision not in ("approved","rejected"):raise HTTPException(422,"Unsupported approval decision")
                 a["decision"]=decision;a["nonce"]=nonce
-                s["receipts"].append({"receiptType":"approval","receiptId":rid,"approvalId":a["approvalId"],"decision":decision,"nonce":nonce})
+                s["receipts"].append({"receiptType":"approval","receiptId":rid,"approvalId":a["approvalId"],"actionId":a["actionId"],"toolName":a["toolName"],"decision":decision,"nonce":nonce})
                 if decision=="approved":
-                    _span(s,"approval_gate",1,s["agentSpanId"],{"ga5.run.id":run_id,"ga5.public.marker":s["publicMarker"],"ga5.approval.id":a["approvalId"],"ga5.approval.nonce":nonce,"ga5.receipt.id":rid,"ga5.receipt.nonce":nonce},1)
+                    _span(s,"approval_gate",1,s["agentSpanId"],{"ga5.run.id":run_id,"ga5.public.marker":s["publicMarker"],"ga5.action.id":a["actionId"],"ga5.phase":"approval","gen_ai.tool.name":a["toolName"],"ga5.approval.id":a["approvalId"],"ga5.approval.nonce":nonce,"ga5.receipt.id":rid,"ga5.receipt.nonce":nonce,"ga5.receipt.type":"approval","ga5.approval.decision":"approved"},1)
                     dispatched += _make_effect(s,a)
                 else:
                     resp=_set_terminal(s,"failed",[a["toolName"]])
@@ -547,14 +555,29 @@ async def post_receipts(run_id:str,request:Request):
                 if oc.get("errorType")=="timeout" or status==0: attrs["error.type"]="timeout";span_status=2
                 elif status is not None and not 200<=status<300:attrs["http.response.status_code"]=status;attrs["error.type"]=str(status);span_status=2
                 if status is not None:attrs["http.response.status_code"]=status
+                correlated_attrs={
+                    "ga5.receipt.id":rid,
+                    "ga5.receipt.nonce":nonce,
+                    "ga5.receipt.type":"outcome",
+                    "ga5.action.id":action_id,
+                    "ga5.call.id":call_id,
+                    "ga5.attempt":attempt,
+                    "http.response.status_code":status,
+                }
+                if err_type:
+                    correlated_attrs["error.type"]=err_type
                 for sp in s["spans"]:
-                    if sp["spanId"]==d["clientSpanId"]:
+                    keys={x.get("key"):x.get("value",{}).get("stringValue") for x in sp.get("attributes",[])}
+                    is_action_span=keys.get("ga5.action.id")==action_id and sp["name"]==f"execute_tool {d['toolName']}"
+                    is_client_span=sp["spanId"]==d["clientSpanId"]
+                    if is_client_span or is_action_span:
                         existing={x["key"]:x["value"] for x in sp["attributes"]}
-                        for k,v in attrs.items(): existing[k]={"stringValue":str(v)} if isinstance(v,str) else {"intValue":str(v)}
+                        for k,v in correlated_attrs.items():
+                            if v is not None:
+                                existing[k]={"stringValue":str(v)} if isinstance(v,str) else {"intValue":str(v)}
                         sp["attributes"]=[{"key":k,"value":v} for k,v in existing.items()]
-                        sp["status"]={"code":span_status}
-                    if sp["name"]==f"execute_tool {d['toolName']}" and any(x.get("key")=="ga5.action.id" and x.get("value",{}).get("stringValue")==d["actionId"] for x in sp["attributes"]):
-                        if span_status==2: sp["status"]={"code":2}
+                        if is_client_span or span_status==2:
+                            sp["status"]={"code":span_status if is_client_span else 2}
                 if status==503 and d["attempt"]==1:
                     retry += [_make_dispatch(s,d["toolName"],d["arguments"],d["phase"],d.get("evidence",[]),2,d["actionId"],d["callId"],d.get("approvalId"),d.get("approvalNonce"))]
             if retry:resp=_waiting(s,retry,[])
