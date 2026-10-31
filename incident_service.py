@@ -546,11 +546,15 @@ async def post_receipts(run_id:str,request:Request):
                 seen.add(key);accepted.append((oc,by[key]))
             retry=[]
             for oc,d in accepted:
+                action_id=d["actionId"]
+                call_id=d["callId"]
+                attempt=d["attempt"]
+                err_type=oc.get("errorType")
                 status=oc.get("status");
                 try:status=int(status) if status is not None else None
                 except Exception:status=None
                 nonce=oc.get("nonce") or _id(8)
-                rec={"receiptType":"outcome","receiptId":rid,"actionId":d["actionId"],"callId":d["callId"],"phase":d["phase"],"toolName":d["toolName"],"attempt":d["attempt"],"status":status,"resultClass":oc.get("resultClass"),"errorType":oc.get("errorType"),"nonce":nonce,"approvalId":d.get("approvalId"),"approvalNonce":d.get("approvalNonce")}
+                rec={"receiptType":"outcome","receiptId":rid,"actionId":action_id,"callId":call_id,"phase":d["phase"],"toolName":d["toolName"],"attempt":attempt,"status":status,"resultClass":oc.get("resultClass"),"errorType":err_type,"nonce":nonce,"approvalId":d.get("approvalId"),"approvalNonce":d.get("approvalNonce")}
                 s["receipts"].append(rec)
                 attrs={"ga5.receipt.id":rid,"ga5.receipt.nonce":nonce}
                 span_status=1
