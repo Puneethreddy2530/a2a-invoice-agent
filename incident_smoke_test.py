@@ -205,3 +205,5 @@ for action in action_rows:
     assert any(x.get("actionId") == action["actionId"] and x.get("callId") == action["callId"]
                and x.get("attempt") == action["attempt"] for x in receipt_rows), action
 print("PASS: case aliases, decoys, known-good release, exact flag, policy gates, trace nesting and action/receipt correlation")
+
+# Regression suite version 2: case-aware planning and telemetry integrity.
