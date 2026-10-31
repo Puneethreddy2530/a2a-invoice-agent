@@ -98,3 +98,110 @@ body_secret={**body,'runId':'test-secret','sensitive':{'accessToken':secret},'in
 sec=c.post('/v2/incidents',json=body_secret)
 assert sec.status_code==200 and secret not in json.dumps(sec.json())
 print('PASS: retry/replay conflicts, terminal immutability, timeout suppression, sensitive redaction')
+
+# ---------------- Extended GA3 planner and telemetry regressions ----------------
+from incident_planner import analyze_incident, extract_entities
+
+def plan_for(title, transcript, allowed=None):
+    incident = {
+        "service": "checkout-api",
+        "severity": "SEV-1",
+        "title": title,
+        "transcript": transcript,
+        "allowedRootCauses": allowed or [
+            "deployment_regression", "database_connection_exhaustion",
+            "dependency_certificate_expired", "feature_flag_recursion",
+            "traffic_capacity_exhaustion", "secret_rotation_mismatch",
+            "thread_deadlock", "memory_exhaustion", "rate_limit_exhaustion",
+            "upstream_dependency_failure",
+        ],
+    }
+    return incident, analyze_incident(incident, tools, {
+        "effectTools": ["restart_pod","scale_service","rollback_deployment","disable_feature","page_owner","open_incident"],
+        "approvalRequiredFor": ["rollback_deployment","disable_feature"],
+        "maximumDiagnostics": 3,
+    })
+
+# Decoys must not drive a diagnosis; a rollback must target the known-good release.
+deployment_inc, deployment_plan = plan_for(
+    "Checkout deployment regression",
+    "[E1] Bounded observation: release-v3.2.1 crashed on boot with SyntaxError.\\n"
+    "[E2] Incident-window record: previous release-v3.2.0 remains healthy with no matching errors.\\n"
+    "[E3] On-call finding: rollback to release-v3.2.0 is the approved recovery.\\n"
+    "[DECOY-1] An older postmortem mentions certificates but is not decision evidence."
+)
+cause, evidence, diagnostics, effect, approval = deployment_plan
+assert cause == "deployment_regression", cause
+assert "DECOY-1" not in evidence, evidence
+assert effect == "rollback_deployment", effect
+from incident_planner import get_effect_arguments
+rollback_args = get_effect_arguments(effect, deployment_inc, cause, tools)
+assert rollback_args.get("target_version") == "release-v3.2.0", rollback_args
+assert approval is True
+assert all(d["toolName"] not in ("rollback_deployment","disable_feature","scale_service","page_owner","open_incident","restart_pod") for d in diagnostics)
+
+# Allowed cause aliases should map by family, not require every canonical word.
+alias_inc, alias_plan = plan_for(
+    "Pool exhaustion",
+    "[E1] Correlated sample: pool acquisition timeout is high.\\n"
+    "[E2] Incident-window record: database connection checkout wait is 2s.",
+    ["db_pool_exhausted", "deployment_regression"]
+)
+assert alias_plan[0] == "db_pool_exhausted", alias_plan[0]
+
+# Exact feature flag name is preserved for the disabling effect.
+flag_inc, flag_plan = plan_for(
+    "Recursive feature evaluation",
+    "[E1] Bounded observation: feature flag flag_checkout_rules_v2 enters recursive evaluation.\\n"
+    "[E2] Incident-window record: evaluation depth exceeded on checkout-api."
+)
+flag_cause, flag_ev, flag_diag, flag_effect, flag_approval = flag_plan
+assert flag_cause == "feature_flag_recursion", flag_cause
+assert flag_effect == "disable_feature", flag_effect
+flag_args = get_effect_arguments(flag_effect, flag_inc, flag_cause, tools)
+assert flag_args.get("flag_name") == "flag_checkout_rules_v2", flag_args
+assert flag_approval is True
+
+# At the exact scaling ceiling, page the owner and never propose scale_service.
+limit_inc, limit_plan = plan_for(
+    "Traffic capacity exhaustion",
+    "[E1] Bounded observation: CPU utilization reached 98% and queue depth is rising.\\n"
+    "[E2] Incident-window record: current replicas=5, maximum=5.\\n"
+    "[E3] On-call finding: already at its permitted scaling limit; page the service owner rather than raising replicas."
+)
+assert limit_plan[0] == "traffic_capacity_exhaustion", limit_plan[0]
+assert limit_plan[3] == "page_owner", limit_plan[3]
+assert all(d["toolName"] != "scale_service" for d in limit_plan[2])
+
+# Exhausted delegation and a change freeze also require human escalation.
+blocked_inc, blocked_plan = plan_for(
+    "Deployment regression",
+    "[E1] Bounded observation: release-v4 crashed on boot with SyntaxError.\\n"
+    "[E2] Incident-window record: release-v3 remains healthy.\\n"
+    "[E3] On-call finding: Rollback delegation=0; freeze=1; remaining approved reversions=1. "
+    "Otherwise page the owner."
+)
+assert blocked_plan[3] == "page_owner", blocked_plan[3]
+
+# Trace topology must be a proper parent tree with parent intervals enclosing children.
+flat_spans = fin.json()["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+by_span = {sp["spanId"]: sp for sp in flat_spans}
+for child in flat_spans:
+    parent_id = child.get("parentSpanId")
+    if parent_id in by_span:
+        parent = by_span[parent_id]
+        assert int(parent["startTimeUnixNano"]) <= int(child["startTimeUnixNano"])
+        assert int(parent["endTimeUnixNano"]) >= int(child["endTimeUnixNano"])
+
+# Logical action/call/attempt IDs must line up across tool spans and receipt log.
+action_rows = fin.json()["actionLog"]
+receipt_rows = fin.json()["receiptLog"]
+for action in action_rows:
+    matching = [x for x in flat_spans if any(
+        a["key"] == "ga5.action.id" and a["value"].get("stringValue") == action["actionId"]
+        for a in x.get("attributes", [])
+    )]
+    assert matching, action
+    assert any(x.get("actionId") == action["actionId"] and x.get("callId") == action["callId"]
+               and x.get("attempt") == action["attempt"] for x in receipt_rows), action
+print("PASS: case aliases, decoys, known-good release, exact flag, policy gates, trace nesting and action/receipt correlation")
