@@ -1163,3 +1163,7 @@ if os.getenv("INIT_DB_ON_IMPORT", "0") == "1":
 # IITM TDS GA3: observable incident triage service
 from incident_service import router as incident_router
 app.include_router(incident_router)
+
+# IITM TDS GA3 Q3: signed-receipt Safe AI Mailroom action gate
+from mailroom_agent.agent import router as mailroom_router
+app.include_router(mailroom_router)
