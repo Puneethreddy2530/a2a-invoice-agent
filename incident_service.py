@@ -400,9 +400,11 @@ def _make_dispatch(s,tool,args,phase,evidence=None,attempt=1,action_id=None,call
     if not exec_id:
         attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"ga5.call.id":call_id,"ga5.phase":phase,"gen_ai.tool.name":tool,"gen_ai.tool.call.id":call_id,"gen_ai.operation.name":"execute_tool"}
         if approval_id:attrs["ga5.approval.id"]=approval_id
+        if approval_nonce:attrs["ga5.approval.nonce"]=approval_nonce
         exec_id=_span(s,f"execute_tool {tool}",1,s["agentSpanId"],attrs,1)
     client_attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"ga5.call.id":call_id,"ga5.phase":phase,"ga5.attempt":attempt,"gen_ai.tool.call.id":call_id,"http.request.method":"POST","http.request.resend_count":max(0,attempt-1)}
     if approval_id:client_attrs["ga5.approval.id"]=approval_id
+    if approval_nonce:client_attrs["ga5.approval.nonce"]=approval_nonce
     client_id=_span(s,f"POST tool/{tool}",3,exec_id,client_attrs,1)
     d={"actionId":action_id,"callId":call_id,"phase":phase,"toolName":tool,"arguments":args,"evidence":evidence or [],"attempt":attempt,"traceparent":_traceparent(s["traceId"],client_id),"clientSpanId":client_id,"approvalId":approval_id,"approvalNonce":approval_nonce,"tracestate":s.get("traceState")}
     s["dispatches"].append(d)
@@ -548,7 +550,7 @@ async def post_receipts(run_id:str,request:Request):
                 try:status=int(status) if status is not None else None
                 except Exception:status=None
                 nonce=oc.get("nonce") or _id(8)
-                rec={"receiptType":"outcome","receiptId":rid,"actionId":d["actionId"],"callId":d["callId"],"attempt":d["attempt"],"status":status,"resultClass":oc.get("resultClass"),"errorType":oc.get("errorType"),"nonce":nonce}
+                rec={"receiptType":"outcome","receiptId":rid,"actionId":d["actionId"],"callId":d["callId"],"phase":d["phase"],"toolName":d["toolName"],"attempt":d["attempt"],"status":status,"resultClass":oc.get("resultClass"),"errorType":oc.get("errorType"),"nonce":nonce,"approvalId":d.get("approvalId"),"approvalNonce":d.get("approvalNonce")}
                 s["receipts"].append(rec)
                 attrs={"ga5.receipt.id":rid,"ga5.receipt.nonce":nonce}
                 span_status=1
@@ -576,8 +578,13 @@ async def post_receipts(run_id:str,request:Request):
                             if v is not None:
                                 existing[k]={"stringValue":str(v)} if isinstance(v,str) else {"intValue":str(v)}
                         sp["attributes"]=[{"key":k,"value":v} for k,v in existing.items()]
-                        if is_client_span or span_status==2:
-                            sp["status"]={"code":span_status if is_client_span else 2}
+                        # A first-attempt 503 is retryable and must not fail the
+                        # logical execute_tool span if a later attempt succeeds.
+                        logical_failure = span_status==2 and not (status==503 and attempt==1)
+                        if is_client_span:
+                            sp["status"]={"code":span_status}
+                        elif is_action_span and logical_failure:
+                            sp["status"]={"code":2}
                 if status==503 and d["attempt"]==1:
                     retry += [_make_dispatch(s,d["toolName"],d["arguments"],d["phase"],d.get("evidence",[]),2,d["actionId"],d["callId"],d.get("approvalId"),d.get("approvalNonce"))]
             if retry:resp=_waiting(s,retry,[])
