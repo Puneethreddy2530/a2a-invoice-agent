@@ -340,7 +340,10 @@ def _attrs(d:dict):
 
 def _span(state:dict,name:str,kind:int,parent:str|None,attrs:dict,status:int=1,links=None):
     sid=_id(8); start=str(time.time_ns()); end=str(int(start)+50_000_000)
-    item={"traceId":state["traceId"],"spanId":sid,"parentSpanId":parent,"name":name,"kind":kind,"startTimeUnixNano":start,"endTimeUnixNano":end,"attributes":_attrs(attrs),"status":{"code":status}}
+    item={"traceId":state["traceId"],"spanId":sid,"name":name,"kind":kind,"startTimeUnixNano":start,"endTimeUnixNano":end,"attributes":_attrs(attrs),"status":{"code":status}}
+    # parentSpanId is optional in OTLP JSON; omit it for a root span instead
+    # of serializing a null value that strict trace consumers may reject.
+    if parent: item["parentSpanId"]=parent
     if links: item["links"]=links
     state["spans"].append(item)
     return sid
@@ -398,11 +401,11 @@ def _make_dispatch(s,tool,args,phase,evidence=None,attempt=1,action_id=None,call
             if exec_id:
                 break
     if not exec_id:
-        attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"ga5.call.id":call_id,"ga5.phase":phase,"gen_ai.tool.name":tool,"gen_ai.tool.call.id":call_id,"gen_ai.operation.name":"execute_tool"}
+        attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"gen_ai.tool.name":tool,"gen_ai.tool.call.id":call_id,"gen_ai.operation.name":"execute_tool"}
         if approval_id:attrs["ga5.approval.id"]=approval_id
         if approval_nonce:attrs["ga5.approval.nonce"]=approval_nonce
         exec_id=_span(s,f"execute_tool {tool}",1,s["agentSpanId"],attrs,1)
-    client_attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"ga5.call.id":call_id,"ga5.phase":phase,"ga5.attempt":attempt,"gen_ai.tool.call.id":call_id,"http.request.method":"POST","http.request.resend_count":max(0,attempt-1)}
+    client_attrs={"ga5.run.id":s["runId"],"ga5.public.marker":s["publicMarker"],"ga5.action.id":action_id,"ga5.attempt":attempt,"http.request.method":"POST","http.request.resend_count":max(0,attempt-1)}
     if approval_id:client_attrs["ga5.approval.id"]=approval_id
     if approval_nonce:client_attrs["ga5.approval.nonce"]=approval_nonce
     client_id=_span(s,f"POST tool/{tool}",3,exec_id,client_attrs,1)
@@ -527,7 +530,7 @@ async def post_receipts(run_id:str,request:Request):
                 a["decision"]=decision;a["nonce"]=nonce
                 s["receipts"].append({"receiptType":"approval","receiptId":rid,"approvalId":a["approvalId"],"actionId":a["actionId"],"toolName":a["toolName"],"decision":decision,"nonce":nonce})
                 if decision=="approved":
-                    _span(s,"approval_gate",1,s["agentSpanId"],{"ga5.run.id":run_id,"ga5.public.marker":s["publicMarker"],"ga5.action.id":a["actionId"],"ga5.phase":"approval","gen_ai.tool.name":a["toolName"],"ga5.approval.id":a["approvalId"],"ga5.approval.nonce":nonce,"ga5.receipt.id":rid,"ga5.receipt.nonce":nonce,"ga5.receipt.type":"approval","ga5.approval.decision":"approved"},1)
+                    _span(s,"approval_gate",1,s["agentSpanId"],{"ga5.run.id":run_id,"ga5.public.marker":s["publicMarker"],"ga5.approval.id":a["approvalId"],"ga5.approval.nonce":nonce,"ga5.receipt.id":rid,"ga5.receipt.nonce":nonce},1)
                     dispatched += _make_effect(s,a)
                 else:
                     resp=_set_terminal(s,"failed",[a["toolName"]])
@@ -561,33 +564,27 @@ async def post_receipts(run_id:str,request:Request):
                 if oc.get("errorType")=="timeout" or status==0: attrs["error.type"]="timeout";span_status=2
                 elif status is not None and not 200<=status<300:attrs["http.response.status_code"]=status;attrs["error.type"]=str(status);span_status=2
                 if status is not None:attrs["http.response.status_code"]=status
-                correlated_attrs={
-                    "ga5.receipt.id":rid,
-                    "ga5.receipt.nonce":nonce,
-                    "ga5.receipt.type":"outcome",
-                    "ga5.action.id":action_id,
-                    "ga5.call.id":call_id,
-                    "ga5.attempt":attempt,
-                    "http.response.status_code":status,
-                }
+                correlated_attrs={"ga5.receipt.id":rid,"ga5.receipt.nonce":nonce}
+                if status is not None:
+                    correlated_attrs["http.response.status_code"]=status
                 if err_type:
                     correlated_attrs["error.type"]=err_type
+                # Receipt IDs/nonces belong on the exact HTTP client attempt
+                # identified by the dispatch traceparent. The logical
+                # execute_tool span is marked failed only if the final attempt
+                # fails; an initial 503 remains retryable.
                 for sp in s["spans"]:
-                    keys={x.get("key"):x.get("value",{}).get("stringValue") for x in sp.get("attributes",[])}
-                    is_action_span=keys.get("ga5.action.id")==action_id and sp["name"]==f"execute_tool {d['toolName']}"
-                    is_client_span=sp["spanId"]==d["clientSpanId"]
-                    if is_client_span or is_action_span:
+                    if sp["spanId"]==d["clientSpanId"]:
                         existing={x["key"]:x["value"] for x in sp["attributes"]}
                         for k,v in correlated_attrs.items():
-                            if v is not None:
-                                existing[k]={"stringValue":str(v)} if isinstance(v,str) else {"intValue":str(v)}
+                            existing[k]={"stringValue":str(v)} if isinstance(v,str) else {"intValue":str(v)}
                         sp["attributes"]=[{"key":k,"value":v} for k,v in existing.items()]
-                        # A first-attempt 503 is retryable and must not fail the
-                        # logical execute_tool span if a later attempt succeeds.
-                        logical_failure = span_status==2 and not (status==503 and attempt==1)
-                        if is_client_span:
-                            sp["status"]={"code":span_status}
-                        elif is_action_span and logical_failure:
+                        sp["status"]={"code":span_status}
+                logical_failure=span_status==2 and not (status==503 and attempt==1)
+                if logical_failure:
+                    for sp in s["spans"]:
+                        keys={x.get("key"):x.get("value",{}).get("stringValue") for x in sp.get("attributes",[])}
+                        if keys.get("ga5.action.id")==action_id and sp["name"]==f"execute_tool {d['toolName']}":
                             sp["status"]={"code":2}
                 if status==503 and d["attempt"]==1:
                     retry += [_make_dispatch(s,d["toolName"],d["arguments"],d["phase"],d.get("evidence",[]),2,d["actionId"],d["callId"],d.get("approvalId"),d.get("approvalNonce"))]
